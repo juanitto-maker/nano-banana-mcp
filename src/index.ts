@@ -46,7 +46,7 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin: 0; padding: 0; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   .wrap { padding: 12px; }
   img { display: block; width: 100%; height: auto; border-radius: 8px; margin-bottom: 8px; }
   .cap { display: block; font-size: 12px; color: #9aa0a6; text-decoration: none; word-break: break-all; margin-bottom: 14px; }
@@ -76,6 +76,23 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
   function notify(method, params) {
     window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
   }
+
+  // Views MUST report their rendered size so the host can grow the iframe to fit, since the
+  // host has no other way to know the content outgrew its initial (often short) default frame.
+  // Debounced because img.onload and window "resize" can both fire in quick bursts.
+  var sizeReportTimer = null;
+  function reportSize() {
+    if (sizeReportTimer) clearTimeout(sizeReportTimer);
+    sizeReportTimer = setTimeout(function () {
+      sizeReportTimer = null;
+      notify("ui/notifications/size-changed", {
+        width: document.documentElement.scrollWidth,
+        height: document.documentElement.scrollHeight
+      });
+    }, 100);
+  }
+
+  window.addEventListener("resize", reportSize);
 
   function extractUrls(content) {
     var urls = [];
@@ -141,6 +158,7 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     app.innerHTML = "";
     urls.forEach(function (url) {
       var img = document.createElement("img");
+      img.onload = reportSize;
       img.src = url;
       img.alt = "Generated image";
       var a = document.createElement("a");
@@ -153,6 +171,7 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       app.appendChild(a);
     });
     rendered = true;
+    reportSize();
   }
 
   function renderImages(imgs) {
@@ -160,11 +179,13 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     app.innerHTML = "";
     imgs.forEach(function (im) {
       var img = document.createElement("img");
+      img.onload = reportSize;
       img.src = "data:" + im.mimeType + ";base64," + im.data;
       img.alt = "Generated image";
       app.appendChild(img);
     });
     rendered = true;
+    reportSize();
   }
 
   function handleContent(content) {
