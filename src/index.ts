@@ -49,11 +49,46 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
   html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   .wrap { padding: 12px; }
   img { display: block; width: 100%; height: auto; border-radius: 8px; margin-bottom: 8px; }
+  img.expandable { cursor: pointer; }
   .cap { display: block; font-size: 12px; color: #9aa0a6; text-decoration: none; word-break: break-all; margin-bottom: 14px; }
   .cap:hover { color: #c8cbcf; text-decoration: underline; }
+  .hint { display: block; font-size: 11px; color: #9aa0a6; text-align: center; cursor: pointer; margin: -4px 0 14px; }
+  .hint:hover { color: #c8cbcf; }
   .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
   .debug { list-style: none; margin: 8px 12px 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7a8085; }
   .debug li { padding: 2px 0; border-bottom: 1px solid #1c1c1f; }
+
+  /* Fixed-height container (hostContext.containerDimensions.height): the host controls the
+     frame size, so fill it and scale the whole image to fit instead of letting it overflow/crop. */
+  html.fill-mode, html.fill-mode body, html.fill-mode .wrap { height: 100%; }
+  html.fill-mode .wrap {
+    padding: 0;
+    box-sizing: border-box;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  html.fill-mode img { max-height: 100%; width: auto; max-width: 100%; height: auto; object-fit: contain; margin: 0; }
+  html.fill-mode .cap { display: none; }
+
+  /* Fullscreen display mode (hostContext.displayMode === "fullscreen"): same idea, across the
+     whole viewport, over a dark backdrop. */
+  html.fullscreen-mode, html.fullscreen-mode body, html.fullscreen-mode .wrap { height: 100%; }
+  html.fullscreen-mode .wrap {
+    padding: 0;
+    box-sizing: border-box;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+  }
+  html.fullscreen-mode img { max-height: 100%; max-width: 100%; width: auto; height: auto; object-fit: contain; margin: 0; border-radius: 0; }
+  html.fullscreen-mode .cap,
+  html.fullscreen-mode .hint { display: none; }
 </style>
 </head>
 <body>
@@ -68,20 +103,71 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
   function send(method, params) {
     var id = nextId++;
     window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params || {} }, "*");
-    return new Promise(function (resolve, reject) {
+    var promise = new Promise(function (resolve, reject) {
       pending[id] = { resolve: resolve, reject: reject };
     });
+    promise.requestId = id;
+    return promise;
   }
 
   function notify(method, params) {
     window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
   }
 
+  // hostContext (SEP-1865 HostContext) is merged in from the ui/initialize result and from
+  // ui/notifications/host-context-changed, and drives which layout mode is active.
+  var hostContext = {};
+  var initializeRequestId = null;
+
+  function isFixedHeight(dims) {
+    return !!(dims && typeof dims.height === "number");
+  }
+
+  function fullscreenAvailable() {
+    var modes = hostContext.availableDisplayModes || [];
+    return modes.indexOf("fullscreen") !== -1;
+  }
+
+  // Fixed containerDimensions.height or an active fullscreen displayMode means the host
+  // controls the frame size, so switch to a fill layout (CSS classes) instead of the default
+  // natural-height layout that relies on us reporting our own size.
+  function applyLayout() {
+    var root = document.documentElement;
+    root.classList.remove("fill-mode", "fullscreen-mode");
+    if (hostContext.displayMode === "fullscreen") {
+      root.classList.add("fullscreen-mode");
+    } else if (isFixedHeight(hostContext.containerDimensions)) {
+      root.classList.add("fill-mode");
+    }
+  }
+
+  function applyHostContext(partial) {
+    if (!partial || typeof partial !== "object") return;
+    for (var key in partial) {
+      if (Object.prototype.hasOwnProperty.call(partial, key)) hostContext[key] = partial[key];
+    }
+    applyLayout();
+  }
+
+  function requestDisplayMode(mode) {
+    send("ui/request-display-mode", { mode: mode }).then(function (result) {
+      hostContext.displayMode = (result && result.mode) || hostContext.displayMode || "inline";
+      applyLayout();
+    });
+  }
+
+  function toggleExpand() {
+    requestDisplayMode(hostContext.displayMode === "fullscreen" ? "inline" : "fullscreen");
+  }
+
   // Views MUST report their rendered size so the host can grow the iframe to fit, since the
   // host has no other way to know the content outgrew its initial (often short) default frame.
-  // Debounced because img.onload and window "resize" can both fire in quick bursts.
+  // Debounced because img.onload and window "resize" can both fire in quick bursts. Skipped
+  // when the host controls the frame size (fill/fullscreen mode) - nothing for it to act on.
   var sizeReportTimer = null;
   function reportSize() {
+    var root = document.documentElement;
+    if (root.classList.contains("fill-mode") || root.classList.contains("fullscreen-mode")) return;
     if (sizeReportTimer) clearTimeout(sizeReportTimer);
     sizeReportTimer = setTimeout(function () {
       sizeReportTimer = null;
@@ -153,6 +239,17 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       '<ul class="debug">' + items + "</ul>";
   }
 
+  function attachExpand(img, app) {
+    if (!fullscreenAvailable()) return;
+    img.className = "expandable";
+    img.addEventListener("click", toggleExpand);
+    var hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "⤢ tap to expand";
+    hint.addEventListener("click", toggleExpand);
+    app.appendChild(hint);
+  }
+
   function render(urls) {
     var app = document.getElementById("app");
     app.innerHTML = "";
@@ -161,14 +258,15 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       img.onload = reportSize;
       img.src = url;
       img.alt = "Generated image";
+      app.appendChild(img);
       var a = document.createElement("a");
       a.className = "cap";
       a.href = url;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       a.textContent = url;
-      app.appendChild(img);
       app.appendChild(a);
+      attachExpand(img, app);
     });
     rendered = true;
     reportSize();
@@ -183,6 +281,7 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       img.src = "data:" + im.mimeType + ";base64," + im.data;
       img.alt = "Generated image";
       app.appendChild(img);
+      attachExpand(img, app);
     });
     rendered = true;
     reportSize();
@@ -205,6 +304,11 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     logMessage(data);
 
     if (data.id !== undefined && (data.result !== undefined || data.error !== undefined)) {
+      // Applied synchronously here (not in the send().then() below) so layout/capability state
+      // is in place before any tool-result content on this same response gets rendered.
+      if (data.id === initializeRequestId && data.result) {
+        applyHostContext(data.result.hostContext);
+      }
       var p = pending[data.id];
       if (p) {
         delete pending[data.id];
@@ -223,6 +327,11 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       return;
     }
 
+    if (data.method === "ui/notifications/host-context-changed") {
+      applyHostContext(data.params);
+      return;
+    }
+
     // Accept the tool result regardless of the exact method name (e.g.
     // "ui/notifications/tool-result", "notifications/tool-result", "tools/result", ...) -
     // what matters is that params carry a content array.
@@ -230,12 +339,14 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     if (paramsContent) handleContent(paramsContent);
   });
 
-  send("ui/initialize", {
+  var initPromise = send("ui/initialize", {
     capabilities: {},
     clientInfo: { name: "nano-banana-mcp-view", version: "1.0.0" },
     protocolVersion: "2026-01-26",
-    appCapabilities: { availableDisplayModes: ["inline"] }
-  }).then(
+    appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] }
+  });
+  initializeRequestId = initPromise.requestId;
+  initPromise.then(
     function () {
       notify("ui/notifications/initialized", {});
     },
