@@ -15,6 +15,20 @@ function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
+  }
+  return btoa(binary);
+}
+
+function base64ByteLength(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return (base64.length * 3) / 4 - padding;
+}
+
 // MCP Apps (SEP-1865, extension id "io.modelcontextprotocol/ui"): predeclared ui:// resource,
 // linked from the tool via _meta.ui.resourceUri, rendered in a sandboxed iframe by the host.
 const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
@@ -240,6 +254,7 @@ const TOOL_DEFINITION = {
   description:
     "Generate one or more images from a text prompt using Google's Gemini 2.5 Flash Image model (nano banana). " +
     "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content. " +
+    "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image. " +
     "On hosts that support MCP Apps, the image also renders inline as an embedded HTML view.",
   inputSchema: {
     type: "object",
@@ -270,17 +285,51 @@ const TOOL_DEFINITION = {
   },
 };
 
-async function callGemini(env: Env, prompt: string, aspectRatio: string, numImages: number) {
-  const fullPrompt =
-    numImages > 1
-      ? `Generate ${numImages} distinct variations. ${prompt} (aspect ratio ${aspectRatio})`
-      : `${prompt} (aspect ratio ${aspectRatio})`;
+const EDIT_TOOL_DEFINITION = {
+  name: "edit_image",
+  description:
+    "Edit an existing image with a natural-language instruction, using Google's Gemini 2.5 Flash Image model (nano banana). " +
+    "The source image can be a public HTTPS URL or the 8-character id from a previous generate_image/edit_image result " +
+    "(the trailing segment of its returned URL). The result includes a publicly reachable URL for each output image " +
+    "(valid for 24 hours) alongside the raw image content. On hosts that support MCP Apps, the image also renders inline " +
+    "as an embedded HTML view.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      image: {
+        type: "string",
+        description:
+          "A public HTTPS URL to the source image, or the 8-character id from a previous generate_image/edit_image result.",
+      },
+      instruction: {
+        type: "string",
+        description:
+          'The edit to perform, e.g. "make it dusk", "remove the car", "change background to a beach".',
+      },
+      aspect_ratio: {
+        type: "string",
+        enum: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+        description: "Desired output aspect ratio. If omitted, the source image's framing is preserved.",
+      },
+    },
+    required: ["image", "instruction"],
+  },
+  _meta: {
+    ui: {
+      resourceUri: UI_RESOURCE_URI,
+      visibility: ["model", "app"],
+    },
+  },
+};
 
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+
+async function callGeminiApi(env: Env, contents: any[]) {
   const resp = await fetch(GEMINI_URL(env.GEMINI_API_KEY), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
+      contents,
       generationConfig: { responseModalities: ["IMAGE"] },
     }),
   });
@@ -307,6 +356,93 @@ async function callGemini(env: Env, prompt: string, aspectRatio: string, numImag
   return images;
 }
 
+async function callGemini(env: Env, prompt: string, aspectRatio: string, numImages: number) {
+  const fullPrompt =
+    numImages > 1
+      ? `Generate ${numImages} distinct variations. ${prompt} (aspect ratio ${aspectRatio})`
+      : `${prompt} (aspect ratio ${aspectRatio})`;
+
+  return callGeminiApi(env, [{ role: "user", parts: [{ text: fullPrompt }] }]);
+}
+
+async function callGeminiEdit(
+  env: Env,
+  source: { data: string; mimeType: string },
+  instruction: string,
+  aspectRatio?: string
+) {
+  const text = aspectRatio ? `${instruction} (aspect ratio ${aspectRatio})` : instruction;
+
+  return callGeminiApi(env, [
+    {
+      role: "user",
+      parts: [
+        { inline_data: { mime_type: source.mimeType, data: source.data } },
+        { text },
+      ],
+    },
+  ]);
+}
+
+async function resolveSourceImage(
+  env: Env,
+  image: string
+): Promise<{ data: string; mimeType: string } | { error: string }> {
+  if (/^[a-z0-9-]{8}$/i.test(image)) {
+    const { value, metadata } = await env.IMAGES.getWithMetadata<{ mimeType?: string }>(
+      `img:${image}`,
+      "text"
+    );
+    if (value === null) {
+      return { error: "source image not found or expired" };
+    }
+    if (base64ByteLength(value) > MAX_IMAGE_BYTES) {
+      return { error: `source image exceeds the ${MAX_IMAGE_BYTES} byte size limit` };
+    }
+    return { data: value, mimeType: metadata?.mimeType || "image/png" };
+  }
+
+  if (/^https?:\/\//i.test(image)) {
+    let resp: Response;
+    try {
+      resp = await fetch(image);
+    } catch (err: any) {
+      return { error: `failed to fetch source image: ${err.message || String(err)}` };
+    }
+    if (!resp.ok) {
+      return { error: `failed to fetch source image (HTTP ${resp.status})` };
+    }
+    const buf = await resp.arrayBuffer();
+    if (buf.byteLength > MAX_IMAGE_BYTES) {
+      return { error: `source image exceeds the ${MAX_IMAGE_BYTES} byte size limit` };
+    }
+    const mimeType = resp.headers.get("Content-Type")?.split(";")[0].trim() || "image/png";
+    return { data: bytesToBase64(new Uint8Array(buf)), mimeType };
+  }
+
+  return {
+    error: "'image' must be an https:// URL or an 8-character id from a previous result",
+  };
+}
+
+async function storeImagesAndBuildContent(
+  env: Env,
+  images: Array<{ type: string; data: string; mimeType: string }>,
+  ctx: { origin: string; token: string }
+) {
+  const urls: string[] = [];
+  for (const img of images) {
+    const id = crypto.randomUUID().slice(0, 8);
+    await env.IMAGES.put(`img:${id}`, img.data, {
+      expirationTtl: IMAGE_TTL_SECONDS,
+      metadata: { mimeType: img.mimeType },
+    });
+    urls.push(`${ctx.origin}/${ctx.token}/img/${id}`);
+  }
+
+  return [{ type: "text", text: urls.join("\n") }, ...images];
+}
+
 async function handleRpc(
   req: JsonRpcRequest,
   env: Env,
@@ -327,7 +463,7 @@ async function handleRpc(
       });
 
     case "tools/list":
-      return jsonRpcResult(req.id, { tools: [TOOL_DEFINITION] });
+      return jsonRpcResult(req.id, { tools: [TOOL_DEFINITION, EDIT_TOOL_DEFINITION] });
 
     case "resources/list":
       return jsonRpcResult(req.id, {
@@ -335,7 +471,8 @@ async function handleRpc(
           {
             uri: UI_RESOURCE_URI,
             name: "Generated Image Viewer",
-            description: "Inline MCP App view that renders the image(s) produced by generate_image.",
+            description:
+              "Inline MCP App view that renders the image(s) produced by generate_image or edit_image.",
             mimeType: UI_MIME_TYPE,
           },
         ],
@@ -364,40 +501,68 @@ async function handleRpc(
 
     case "tools/call": {
       const { name, arguments: args } = req.params ?? {};
-      if (name !== "generate_image") {
-        return jsonRpcError(req.id, -32601, `Unknown tool: ${name}`);
-      }
-      const prompt = args?.prompt;
-      if (!prompt || typeof prompt !== "string") {
-        return jsonRpcResult(req.id, {
-          isError: true,
-          content: [{ type: "text", text: "Missing required 'prompt' argument." }],
-        });
-      }
-      const aspectRatio = args?.aspect_ratio || "1:1";
-      const numImages = Math.min(Math.max(parseInt(args?.num_images ?? "1", 10) || 1, 1), 4);
 
-      try {
-        const images = await callGemini(env, prompt, aspectRatio, numImages);
-
-        const urls: string[] = [];
-        for (const img of images) {
-          const id = crypto.randomUUID().slice(0, 8);
-          await env.IMAGES.put(`img:${id}`, img.data, {
-            expirationTtl: IMAGE_TTL_SECONDS,
-            metadata: { mimeType: img.mimeType },
+      if (name === "generate_image") {
+        const prompt = args?.prompt;
+        if (!prompt || typeof prompt !== "string") {
+          return jsonRpcResult(req.id, {
+            isError: true,
+            content: [{ type: "text", text: "Missing required 'prompt' argument." }],
           });
-          urls.push(`${ctx.origin}/${ctx.token}/img/${id}`);
         }
+        const aspectRatio = args?.aspect_ratio || "1:1";
+        const numImages = Math.min(Math.max(parseInt(args?.num_images ?? "1", 10) || 1, 1), 4);
 
-        const content = [{ type: "text", text: urls.join("\n") }, ...images];
-        return jsonRpcResult(req.id, { content, isError: false });
-      } catch (err: any) {
-        return jsonRpcResult(req.id, {
-          isError: true,
-          content: [{ type: "text", text: `generate_image failed: ${err.message || String(err)}` }],
-        });
+        try {
+          const images = await callGemini(env, prompt, aspectRatio, numImages);
+          const content = await storeImagesAndBuildContent(env, images, ctx);
+          return jsonRpcResult(req.id, { content, isError: false });
+        } catch (err: any) {
+          return jsonRpcResult(req.id, {
+            isError: true,
+            content: [{ type: "text", text: `generate_image failed: ${err.message || String(err)}` }],
+          });
+        }
       }
+
+      if (name === "edit_image") {
+        const image = args?.image;
+        if (!image || typeof image !== "string") {
+          return jsonRpcResult(req.id, {
+            isError: true,
+            content: [{ type: "text", text: "Missing required 'image' argument." }],
+          });
+        }
+        const instruction = args?.instruction;
+        if (!instruction || typeof instruction !== "string") {
+          return jsonRpcResult(req.id, {
+            isError: true,
+            content: [{ type: "text", text: "Missing required 'instruction' argument." }],
+          });
+        }
+        const aspectRatio = typeof args?.aspect_ratio === "string" ? args.aspect_ratio : undefined;
+
+        try {
+          const source = await resolveSourceImage(env, image);
+          if ("error" in source) {
+            return jsonRpcResult(req.id, {
+              isError: true,
+              content: [{ type: "text", text: source.error }],
+            });
+          }
+
+          const images = await callGeminiEdit(env, source, instruction, aspectRatio);
+          const content = await storeImagesAndBuildContent(env, images, ctx);
+          return jsonRpcResult(req.id, { content, isError: false });
+        } catch (err: any) {
+          return jsonRpcResult(req.id, {
+            isError: true,
+            content: [{ type: "text", text: `edit_image failed: ${err.message || String(err)}` }],
+          });
+        }
+      }
+
+      return jsonRpcError(req.id, -32601, `Unknown tool: ${name}`);
     }
 
     default:
