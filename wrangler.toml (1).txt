@@ -1,0 +1,7 @@
+name = "nano-banana-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Secrets (set via Cloudflare dashboard, never here):
+#   MCP_AUTH_TOKEN  — random token, used as URL path segment for auth
+#   GEMINI_API_KEY  — Google AI Studio key for Gemini 2.5 Flash Image
