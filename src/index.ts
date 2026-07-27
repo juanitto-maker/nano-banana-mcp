@@ -15,6 +15,116 @@ function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
+// MCP Apps (SEP-1865, extension id "io.modelcontextprotocol/ui"): predeclared ui:// resource,
+// linked from the tool via _meta.ui.resourceUri, rendered in a sandboxed iframe by the host.
+const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
+const UI_MIME_TYPE = "text/html;profile=mcp-app";
+const UI_RESOURCE_URI = "ui://nano-banana-mcp/generate-image-view";
+
+// Static view template: performs the ui/initialize handshake, then renders whatever image
+// URL(s) arrive via the host's "ui/notifications/tool-result" notification. No SDK dependency.
+const UI_RESOURCE_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .wrap { padding: 12px; }
+  img { display: block; width: 100%; height: auto; border-radius: 8px; margin-bottom: 8px; }
+  .cap { display: block; font-size: 12px; color: #9aa0a6; text-decoration: none; word-break: break-all; margin-bottom: 14px; }
+  .cap:hover { color: #c8cbcf; text-decoration: underline; }
+  .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="empty">Waiting for image...</div></div>
+<script>
+(function () {
+  var nextId = 1;
+  var pending = {};
+
+  function send(method, params) {
+    var id = nextId++;
+    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params || {} }, "*");
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+    });
+  }
+
+  function notify(method, params) {
+    window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
+  }
+
+  function extractUrls(content) {
+    var urls = [];
+    (content || []).forEach(function (block) {
+      if (block && block.type === "text" && typeof block.text === "string") {
+        block.text.split("\\n").forEach(function (line) {
+          line = line.trim();
+          if (/^https?:\\/\\//.test(line)) urls.push(line);
+        });
+      }
+    });
+    return urls;
+  }
+
+  function render(urls) {
+    var app = document.getElementById("app");
+    if (!urls.length) {
+      app.innerHTML = '<div class="empty">No image URL in result.</div>';
+      return;
+    }
+    app.innerHTML = "";
+    urls.forEach(function (url) {
+      var img = document.createElement("img");
+      img.src = url;
+      img.alt = "Generated image";
+      var a = document.createElement("a");
+      a.className = "cap";
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = url;
+      app.appendChild(img);
+      app.appendChild(a);
+    });
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.jsonrpc !== "2.0") return;
+
+    if (data.id !== undefined && (data.result !== undefined || data.error !== undefined)) {
+      var p = pending[data.id];
+      if (p) {
+        delete pending[data.id];
+        if (data.error) p.reject(new Error(data.error.message || "error"));
+        else p.resolve(data.result);
+      }
+      return;
+    }
+
+    if (data.method === "ui/notifications/tool-result") {
+      render(extractUrls(data.params && data.params.content));
+    } else if (data.method === "ui/resource-teardown" && data.id !== undefined) {
+      window.parent.postMessage({ jsonrpc: "2.0", id: data.id, result: {} }, "*");
+    }
+  });
+
+  send("ui/initialize", {
+    capabilities: {},
+    clientInfo: { name: "nano-banana-mcp-view", version: "1.0.0" },
+    protocolVersion: "2026-01-26",
+    appCapabilities: { availableDisplayModes: ["inline"] }
+  }).then(function () {
+    notify("ui/notifications/initialized", {});
+  });
+})();
+</script>
+</body>
+</html>
+`;
+
 const GEMINI_MODEL = "gemini-2.5-flash-image";
 const GEMINI_URL = (key: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
@@ -38,7 +148,8 @@ const TOOL_DEFINITION = {
   name: "generate_image",
   description:
     "Generate one or more images from a text prompt using Google's Gemini 2.5 Flash Image model (nano banana). " +
-    "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content.",
+    "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content. " +
+    "On hosts that support MCP Apps, the image also renders inline as an embedded HTML view.",
   inputSchema: {
     type: "object",
     properties: {
@@ -59,6 +170,12 @@ const TOOL_DEFINITION = {
       },
     },
     required: ["prompt"],
+  },
+  _meta: {
+    ui: {
+      resourceUri: UI_RESOURCE_URI,
+      visibility: ["model", "app"],
+    },
   },
 };
 
@@ -108,12 +225,51 @@ async function handleRpc(
     case "initialize":
       return jsonRpcResult(req.id, {
         protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
+        capabilities: {
+          tools: {},
+          resources: {},
+          extensions: {
+            [UI_EXTENSION_ID]: { mimeTypes: [UI_MIME_TYPE] },
+          },
+        },
         serverInfo: { name: "nano-banana-mcp", version: "1.0.0" },
       });
 
     case "tools/list":
       return jsonRpcResult(req.id, { tools: [TOOL_DEFINITION] });
+
+    case "resources/list":
+      return jsonRpcResult(req.id, {
+        resources: [
+          {
+            uri: UI_RESOURCE_URI,
+            name: "Generated Image Viewer",
+            description: "Inline MCP App view that renders the image(s) produced by generate_image.",
+            mimeType: UI_MIME_TYPE,
+          },
+        ],
+      });
+
+    case "resources/read": {
+      const uri = req.params?.uri;
+      if (uri !== UI_RESOURCE_URI) {
+        return jsonRpcError(req.id, -32602, `Unknown resource: ${uri}`);
+      }
+      return jsonRpcResult(req.id, {
+        contents: [
+          {
+            uri: UI_RESOURCE_URI,
+            mimeType: UI_MIME_TYPE,
+            text: UI_RESOURCE_HTML,
+            _meta: {
+              ui: {
+                csp: { resourceDomains: [ctx.origin] },
+              },
+            },
+          },
+        ],
+      });
+    }
 
     case "tools/call": {
       const { name, arguments: args } = req.params ?? {};
