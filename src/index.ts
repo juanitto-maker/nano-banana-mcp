@@ -36,7 +36,7 @@ const UI_MIME_TYPE = "text/html;profile=mcp-app";
 
 // Claude.ai caches view HTML by URI — bump VIEW_VERSION whenever UI_RESOURCE_HTML changes, so
 // the resource URI changes too and clients fetch the new HTML instead of a cached stale view.
-const VIEW_VERSION = "v4";
+const VIEW_VERSION = "v5";
 const UI_RESOURCE_URI = `ui://nano-banana-mcp/image-view/${VIEW_VERSION}/app.html`;
 // Compat alias: the URI this server used before it was versioned. Some clients may have cached
 // a tool definition or resource reference pointing at this URI - resources/read still answers
@@ -49,22 +49,63 @@ const UI_RESOURCE_URI_LEGACY = "ui://nano-banana-mcp/generate-image-view";
 //
 // Falls back to a small debug readout (last message methods received) if nothing rendered
 // within 3s or the handshake itself is rejected, so delivery mismatches are diagnosable.
+//
+// DIAGNOSTIC BUILD: the Claude Android client clamps the inline iframe to a fixed height and
+// ignores ui/notifications/size-changed, so this view measures the box it is actually given
+// instead of trying to resize it. Overlaid on the image are: a viewport/document/DPR readout,
+// a 50px grid (count the cells if the text is clipped), a magenta frame border (visible only
+// if our top and bottom edges survive), and four bottom-pinned swatches (a missing swatch
+// tells us how much of the bottom edge the host cut off).
 const UI_RESOURCE_HTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .wrap { height: 100vh; width: 100%; box-sizing: border-box; display: flex; flex-direction: row; align-items: center; justify-content: center; gap: 8px; padding: 8px; }
-  img { max-width: 100%; max-height: 100%; min-width: 0; min-height: 0; object-fit: contain; display: block; border-radius: 8px; }
+  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #111; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+
+  /* Outermost element: the magenta frame. If a magenta edge is missing, that edge is clipped. */
+  #root { position: fixed; inset: 0; box-sizing: border-box; border: 6px solid magenta; background: #111; overflow: hidden; }
+
+  /* Image, full-bleed behind every diagnostic layer. */
+  .wrap { position: absolute; inset: 0; display: flex; flex-direction: row; align-items: center; justify-content: center; z-index: 1; }
+  img { flex: 1 1 0; min-width: 0; min-height: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
   img.expandable { cursor: pointer; }
   .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
   .debug { list-style: none; margin: 8px 12px 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7a8085; }
   .debug li { padding: 2px 0; border-bottom: 1px solid #1c1c1f; }
 
+  /* 50px reference grid - a countable ruler for when the numeric readout is cut off. */
+  #grid {
+    position: absolute; inset: 0; z-index: 2; pointer-events: none;
+    background-image:
+      repeating-linear-gradient(to right, rgba(255,255,255,0.25) 0 1px, transparent 1px 50px),
+      repeating-linear-gradient(to bottom, rgba(255,255,255,0.25) 0 1px, transparent 1px 50px);
+  }
+
+  /* Measurement readout, pinned top-left, outlined so it reads over any image. */
+  #diag {
+    position: absolute; top: 0; left: 0; z-index: 4; pointer-events: none;
+    margin: 0; padding: 6px 10px;
+    white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: clamp(14px, 5vw, 28px);
+    font-weight: 800;
+    line-height: 1.15;
+    color: #fff;
+    text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 0 6px #000;
+  }
+
+  /* Bottom-edge probe: whichever swatch is missing tells us where the bottom got cut. */
+  #swatches { position: absolute; left: 0; right: 0; bottom: 0; height: 40px; z-index: 3; display: flex; pointer-events: none; }
+  #swatches div { flex: 1 1 0; height: 40px; }
+  #swatches .s1 { background: #ff0000; }
+  #swatches .s2 { background: #00c000; }
+  #swatches .s3 { background: #0066ff; }
+  #swatches .s4 { background: #ffee00; }
+
   #closeBtn {
     display: none;
-    position: fixed;
+    position: absolute;
     top: 8px;
     right: 8px;
     width: 44px;
@@ -79,18 +120,24 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    z-index: 10;
+    z-index: 5;
   }
 
   /* Lightbox: host granted the fullscreen display mode we requested on tap. */
-  html.fullscreen-mode, html.fullscreen-mode body { background: #000; }
-  html.fullscreen-mode img { border-radius: 0; }
+  html.fullscreen-mode, html.fullscreen-mode body, html.fullscreen-mode #root { background: #000; }
   html.fullscreen-mode #closeBtn { display: flex; }
 </style>
 </head>
 <body>
-<div class="wrap" id="app"><div class="empty">Waiting for image...</div></div>
-<button type="button" id="closeBtn" aria-label="Close fullscreen">&#10005;</button>
+<div id="root">
+  <div class="wrap" id="app"><div class="empty">Waiting for image...</div></div>
+  <div id="grid"></div>
+  <div id="swatches"><div class="s1"></div><div class="s2"></div><div class="s3"></div><div class="s4"></div></div>
+  <pre id="diag">VP  ? x ?
+DOC ? x ?
+DPR ?</pre>
+  <button type="button" id="closeBtn" aria-label="Close fullscreen">&#10005;</button>
+</div>
 <script>
 (function () {
   var nextId = 1;
@@ -170,7 +217,28 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     }, 100);
   }
 
-  window.addEventListener("resize", reportSize);
+  // Self-measurement. The host clamps the inline iframe and ignores the size-changed
+  // notification above, so we report back the box we were actually handed. Sampled on a timer
+  // as well as on load/resize because the host may resize the frame after first paint without
+  // always firing a "resize" event we can observe.
+  function updateDiag() {
+    var el = document.getElementById("diag");
+    if (!el) return;
+    el.textContent =
+      "VP  " + window.innerWidth + " x " + window.innerHeight + "\\n" +
+      "DOC " + document.documentElement.clientWidth + " x " + document.documentElement.clientHeight + "\\n" +
+      "DPR " + (window.devicePixelRatio || 1);
+  }
+
+  var diagTimer = setInterval(updateDiag, 500);
+  setTimeout(function () { clearInterval(diagTimer); }, 5000);
+  window.addEventListener("load", updateDiag);
+  updateDiag();
+
+  window.addEventListener("resize", function () {
+    updateDiag();
+    reportSize();
+  });
 
   function extractUrls(content) {
     var urls = [];
