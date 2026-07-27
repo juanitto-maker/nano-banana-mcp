@@ -33,7 +33,15 @@ function base64ByteLength(base64: string): number {
 // linked from the tool via _meta.ui.resourceUri, rendered in a sandboxed iframe by the host.
 const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
 const UI_MIME_TYPE = "text/html;profile=mcp-app";
-const UI_RESOURCE_URI = "ui://nano-banana-mcp/generate-image-view";
+
+// Claude.ai caches view HTML by URI — bump VIEW_VERSION whenever UI_RESOURCE_HTML changes, so
+// the resource URI changes too and clients fetch the new HTML instead of a cached stale view.
+const VIEW_VERSION = "v4";
+const UI_RESOURCE_URI = `ui://nano-banana-mcp/image-view/${VIEW_VERSION}/app.html`;
+// Compat alias: the URI this server used before it was versioned. Some clients may have cached
+// a tool definition or resource reference pointing at this URI - resources/read still answers
+// it (with the current HTML) so those clients don't break. Not advertised in resources/list.
+const UI_RESOURCE_URI_LEGACY = "ui://nano-banana-mcp/generate-image-view";
 
 // Static view template: performs the ui/initialize handshake, then renders whatever image
 // URL(s) or image content arrive from the host, tolerating several message shapes since hosts
@@ -598,13 +606,13 @@ async function handleRpc(
 
     case "resources/read": {
       const uri = req.params?.uri;
-      if (uri !== UI_RESOURCE_URI) {
+      if (uri !== UI_RESOURCE_URI && uri !== UI_RESOURCE_URI_LEGACY) {
         return jsonRpcError(req.id, -32602, `Unknown resource: ${uri}`);
       }
       return jsonRpcResult(req.id, {
         contents: [
           {
-            uri: UI_RESOURCE_URI,
+            uri,
             mimeType: UI_MIME_TYPE,
             text: UI_RESOURCE_HTML,
             _meta: {
