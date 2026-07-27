@@ -2,6 +2,10 @@ name = "nano-banana-mcp"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 
+[[kv_namespaces]]
+binding = "IMAGES"
+id = "b1ca86a631c44ecda5e8210fcfbe604e"
+
 # Secrets (set via Cloudflare dashboard, never here):
 #   MCP_AUTH_TOKEN  — random token, used as URL path segment for auth
 #   GEMINI_API_KEY  — Google AI Studio key for Gemini 2.5 Flash Image

@@ -1,6 +1,18 @@
 export interface Env {
   MCP_AUTH_TOKEN: string;
   GEMINI_API_KEY: string;
+  IMAGES: KVNamespace;
+}
+
+const IMAGE_TTL_SECONDS = 86400;
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 const GEMINI_MODEL = "gemini-2.5-flash-image";
@@ -25,7 +37,8 @@ function jsonRpcError(id: string | number | null, code: number, message: string)
 const TOOL_DEFINITION = {
   name: "generate_image",
   description:
-    "Generate one or more images from a text prompt using Google's Gemini 2.5 Flash Image model (nano banana).",
+    "Generate one or more images from a text prompt using Google's Gemini 2.5 Flash Image model (nano banana). " +
+    "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content.",
   inputSchema: {
     type: "object",
     properties: {
@@ -86,7 +99,11 @@ async function callGemini(env: Env, prompt: string, aspectRatio: string, numImag
   return images;
 }
 
-async function handleRpc(req: JsonRpcRequest, env: Env): Promise<any> {
+async function handleRpc(
+  req: JsonRpcRequest,
+  env: Env,
+  ctx: { origin: string; token: string }
+): Promise<any> {
   switch (req.method) {
     case "initialize":
       return jsonRpcResult(req.id, {
@@ -115,7 +132,19 @@ async function handleRpc(req: JsonRpcRequest, env: Env): Promise<any> {
 
       try {
         const images = await callGemini(env, prompt, aspectRatio, numImages);
-        return jsonRpcResult(req.id, { content: images, isError: false });
+
+        const urls: string[] = [];
+        for (const img of images) {
+          const id = crypto.randomUUID().slice(0, 8);
+          await env.IMAGES.put(`img:${id}`, img.data, {
+            expirationTtl: IMAGE_TTL_SECONDS,
+            metadata: { mimeType: img.mimeType },
+          });
+          urls.push(`${ctx.origin}/${ctx.token}/img/${id}`);
+        }
+
+        const content = [{ type: "text", text: urls.join("\n") }, ...images];
+        return jsonRpcResult(req.id, { content, isError: false });
       } catch (err: any) {
         return jsonRpcResult(req.id, {
           isError: true,
@@ -132,12 +161,45 @@ async function handleRpc(req: JsonRpcRequest, env: Env): Promise<any> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    // Expect path: /<MCP_AUTH_TOKEN>/mcp
+    // Expect path: /<MCP_AUTH_TOKEN>/mcp or /<MCP_AUTH_TOKEN>/img/<id>
     const parts = url.pathname.split("/").filter(Boolean);
     const token = parts[0];
     const endpoint = parts[1];
 
-    if (!token || token !== env.MCP_AUTH_TOKEN || endpoint !== "mcp") {
+    if (!token || token !== env.MCP_AUTH_TOKEN) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (endpoint === "img") {
+      const id = parts[2];
+      if (request.method !== "GET" || !id) {
+        return new Response("Method not allowed", { status: 405 });
+      }
+
+      const { value, metadata } = await env.IMAGES.getWithMetadata<{ mimeType?: string }>(
+        `img:${id}`,
+        "text"
+      );
+      if (value === null) {
+        return new Response(JSON.stringify({ error: "not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return new Response(base64ToBytes(value), {
+        status: 200,
+        headers: {
+          "Content-Type": metadata?.mimeType || "image/png",
+          "Cache-Control": "public, max-age=86400",
+        },
+      });
+    }
+
+    if (endpoint !== "mcp") {
       return new Response(JSON.stringify({ error: "unauthorized" }), {
         status: 401,
         headers: { "Content-Type": "application/json" },
@@ -165,7 +227,7 @@ export default {
       );
     }
 
-    const result = await handleRpc(body, env);
+    const result = await handleRpc(body, env, { origin: url.origin, token });
     return new Response(JSON.stringify(result), {
       headers: { "Content-Type": "application/json" },
     });
