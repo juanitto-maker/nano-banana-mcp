@@ -46,53 +46,43 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .wrap { padding: 12px; }
-  img { display: block; width: 100%; height: auto; border-radius: 8px; margin-bottom: 8px; }
+  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #0b0b0d; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .wrap { height: 100vh; width: 100%; box-sizing: border-box; display: flex; flex-direction: row; align-items: center; justify-content: center; gap: 8px; padding: 8px; }
+  img { max-width: 100%; max-height: 100%; min-width: 0; min-height: 0; object-fit: contain; display: block; border-radius: 8px; }
   img.expandable { cursor: pointer; }
-  .cap { display: block; font-size: 12px; color: #9aa0a6; text-decoration: none; word-break: break-all; margin-bottom: 14px; }
-  .cap:hover { color: #c8cbcf; text-decoration: underline; }
-  .hint { display: block; font-size: 11px; color: #9aa0a6; text-align: center; cursor: pointer; margin: -4px 0 14px; }
-  .hint:hover { color: #c8cbcf; }
   .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
   .debug { list-style: none; margin: 8px 12px 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7a8085; }
   .debug li { padding: 2px 0; border-bottom: 1px solid #1c1c1f; }
 
-  /* Fixed-height container (hostContext.containerDimensions.height): the host controls the
-     frame size, so fill it and scale the whole image to fit instead of letting it overflow/crop. */
-  html.fill-mode, html.fill-mode body, html.fill-mode .wrap { height: 100%; }
-  html.fill-mode .wrap {
+  #closeBtn {
+    display: none;
+    position: fixed;
+    top: 8px;
+    right: 8px;
+    width: 44px;
+    height: 44px;
     padding: 0;
-    box-sizing: border-box;
-    display: flex;
-    flex-wrap: wrap;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 20px;
+    line-height: 1;
     align-items: center;
     justify-content: center;
-    gap: 8px;
+    cursor: pointer;
+    z-index: 10;
   }
-  html.fill-mode img { max-height: 100%; width: auto; max-width: 100%; height: auto; object-fit: contain; margin: 0; }
-  html.fill-mode .cap { display: none; }
 
-  /* Fullscreen display mode (hostContext.displayMode === "fullscreen"): same idea, across the
-     whole viewport, over a dark backdrop. */
-  html.fullscreen-mode, html.fullscreen-mode body, html.fullscreen-mode .wrap { height: 100%; }
-  html.fullscreen-mode .wrap {
-    padding: 0;
-    box-sizing: border-box;
-    width: 100vw;
-    height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #000;
-  }
-  html.fullscreen-mode img { max-height: 100%; max-width: 100%; width: auto; height: auto; object-fit: contain; margin: 0; border-radius: 0; }
-  html.fullscreen-mode .cap,
-  html.fullscreen-mode .hint { display: none; }
+  /* Lightbox: host granted the fullscreen display mode we requested on tap. */
+  html.fullscreen-mode, html.fullscreen-mode body { background: #000; }
+  html.fullscreen-mode img { border-radius: 0; }
+  html.fullscreen-mode #closeBtn { display: flex; }
 </style>
 </head>
 <body>
 <div class="wrap" id="app"><div class="empty">Waiting for image...</div></div>
+<button type="button" id="closeBtn" aria-label="Close fullscreen">&#10005;</button>
 <script>
 (function () {
   var nextId = 1;
@@ -114,31 +104,22 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
   }
 
-  // hostContext (SEP-1865 HostContext) is merged in from the ui/initialize result and from
-  // ui/notifications/host-context-changed, and drives which layout mode is active.
+  // hostContext/hostCapabilities (SEP-1865) are captured from the ui/initialize result;
+  // hostContext is kept in sync afterwards via ui/notifications/host-context-changed. The
+  // lightbox has no state of its own - it's driven entirely by hostContext.displayMode, so a
+  // host that force-returns to "inline" on its own is reflected automatically, no separate
+  // bookkeeping needed.
   var hostContext = {};
+  var hostCapabilities = {};
   var initializeRequestId = null;
-
-  function isFixedHeight(dims) {
-    return !!(dims && typeof dims.height === "number");
-  }
 
   function fullscreenAvailable() {
     var modes = hostContext.availableDisplayModes || [];
     return modes.indexOf("fullscreen") !== -1;
   }
 
-  // Fixed containerDimensions.height or an active fullscreen displayMode means the host
-  // controls the frame size, so switch to a fill layout (CSS classes) instead of the default
-  // natural-height layout that relies on us reporting our own size.
   function applyLayout() {
-    var root = document.documentElement;
-    root.classList.remove("fill-mode", "fullscreen-mode");
-    if (hostContext.displayMode === "fullscreen") {
-      root.classList.add("fullscreen-mode");
-    } else if (isFixedHeight(hostContext.containerDimensions)) {
-      root.classList.add("fill-mode");
-    }
+    document.documentElement.classList.toggle("fullscreen-mode", hostContext.displayMode === "fullscreen");
   }
 
   function applyHostContext(partial) {
@@ -149,6 +130,12 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     applyLayout();
   }
 
+  function applyInitializeResult(result) {
+    if (!result) return;
+    hostCapabilities = result.hostCapabilities || {};
+    applyHostContext(result.hostContext);
+  }
+
   function requestDisplayMode(mode) {
     send("ui/request-display-mode", { mode: mode }).then(function (result) {
       hostContext.displayMode = (result && result.mode) || hostContext.displayMode || "inline";
@@ -156,18 +143,15 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     });
   }
 
-  function toggleExpand() {
-    requestDisplayMode(hostContext.displayMode === "fullscreen" ? "inline" : "fullscreen");
-  }
+  document.getElementById("closeBtn").addEventListener("click", function () {
+    requestDisplayMode("inline");
+  });
 
   // Views MUST report their rendered size so the host can grow the iframe to fit, since the
   // host has no other way to know the content outgrew its initial (often short) default frame.
-  // Debounced because img.onload and window "resize" can both fire in quick bursts. Skipped
-  // when the host controls the frame size (fill/fullscreen mode) - nothing for it to act on.
+  // Debounced because img.onload and window "resize" can both fire in quick bursts.
   var sizeReportTimer = null;
   function reportSize() {
-    var root = document.documentElement;
-    if (root.classList.contains("fill-mode") || root.classList.contains("fullscreen-mode")) return;
     if (sizeReportTimer) clearTimeout(sizeReportTimer);
     sizeReportTimer = setTimeout(function () {
       sizeReportTimer = null;
@@ -234,20 +218,29 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     var items = recentMethods.length
       ? recentMethods.map(function (m) { return "<li>" + escapeHtml(m) + "</li>"; }).join("")
       : "<li>(no messages received)</li>";
-    app.innerHTML =
+    var box = document.createElement("div");
+    box.innerHTML =
       '<div class="empty">No image received yet.<br>Last messages from host:</div>' +
       '<ul class="debug">' + items + "</ul>";
+    app.innerHTML = "";
+    app.appendChild(box);
   }
 
-  function attachExpand(img, app) {
-    if (!fullscreenAvailable()) return;
-    img.className = "expandable";
-    img.addEventListener("click", toggleExpand);
-    var hint = document.createElement("div");
-    hint.className = "hint";
-    hint.textContent = "⤢ tap to expand";
-    hint.addEventListener("click", toggleExpand);
-    app.appendChild(hint);
+  // Tap behavior, in priority order: request fullscreen if the host offers it (shows the
+  // lightbox once granted); otherwise ask the host to open the image's public URL, if it has
+  // one and the host supports it; otherwise the image just isn't interactive.
+  function attachTap(img, url) {
+    if (fullscreenAvailable()) {
+      img.className = "expandable";
+      img.addEventListener("click", function () {
+        requestDisplayMode("fullscreen");
+      });
+    } else if (url && hostCapabilities.openLinks) {
+      img.className = "expandable";
+      img.addEventListener("click", function () {
+        send("ui/open-link", { url: url }).catch(function () {});
+      });
+    }
   }
 
   function render(urls) {
@@ -258,15 +251,8 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       img.onload = reportSize;
       img.src = url;
       img.alt = "Generated image";
+      attachTap(img, url);
       app.appendChild(img);
-      var a = document.createElement("a");
-      a.className = "cap";
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.textContent = url;
-      app.appendChild(a);
-      attachExpand(img, app);
     });
     rendered = true;
     reportSize();
@@ -280,8 +266,8 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       img.onload = reportSize;
       img.src = "data:" + im.mimeType + ";base64," + im.data;
       img.alt = "Generated image";
+      attachTap(img);
       app.appendChild(img);
-      attachExpand(img, app);
     });
     rendered = true;
     reportSize();
@@ -307,7 +293,7 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       // Applied synchronously here (not in the send().then() below) so layout/capability state
       // is in place before any tool-result content on this same response gets rendered.
       if (data.id === initializeRequestId && data.result) {
-        applyHostContext(data.result.hostContext);
+        applyInitializeResult(data.result);
       }
       var p = pending[data.id];
       if (p) {
