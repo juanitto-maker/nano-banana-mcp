@@ -22,7 +22,11 @@ const UI_MIME_TYPE = "text/html;profile=mcp-app";
 const UI_RESOURCE_URI = "ui://nano-banana-mcp/generate-image-view";
 
 // Static view template: performs the ui/initialize handshake, then renders whatever image
-// URL(s) arrive via the host's "ui/notifications/tool-result" notification. No SDK dependency.
+// URL(s) or image content arrive from the host, tolerating several message shapes since hosts
+// vary in how they deliver the tool result. No SDK dependency.
+//
+// Falls back to a small debug readout (last message methods received) if nothing rendered
+// within 3s or the handshake itself is rejected, so delivery mismatches are diagnosable.
 const UI_RESOURCE_HTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -34,6 +38,8 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
   .cap { display: block; font-size: 12px; color: #9aa0a6; text-decoration: none; word-break: break-all; margin-bottom: 14px; }
   .cap:hover { color: #c8cbcf; text-decoration: underline; }
   .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
+  .debug { list-style: none; margin: 8px 12px 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7a8085; }
+  .debug li { padding: 2px 0; border-bottom: 1px solid #1c1c1f; }
 </style>
 </head>
 <body>
@@ -42,6 +48,8 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
 (function () {
   var nextId = 1;
   var pending = {};
+  var recentMethods = [];
+  var rendered = false;
 
   function send(method, params) {
     var id = nextId++;
@@ -68,12 +76,54 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     return urls;
   }
 
+  function extractImages(content) {
+    var imgs = [];
+    (content || []).forEach(function (block) {
+      if (block && block.type === "image" && typeof block.data === "string") {
+        imgs.push({ data: block.data, mimeType: block.mimeType || "image/png" });
+      }
+    });
+    return imgs;
+  }
+
+  // Any object carrying a tool result may nest it directly as { content: [...] }, or
+  // wrapped as { toolResult: { content: [...] } } depending on the host.
+  function findContent(obj) {
+    if (!obj || typeof obj !== "object") return null;
+    if (Array.isArray(obj.content)) return obj.content;
+    if (obj.toolResult && Array.isArray(obj.toolResult.content)) return obj.toolResult.content;
+    return null;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function logMessage(data) {
+    var label = data.method
+      ? data.method
+      : data.id !== undefined
+      ? "response(id=" + data.id + ")"
+      : "unknown";
+    recentMethods.push(label);
+    if (recentMethods.length > 10) recentMethods.shift();
+  }
+
+  function showDebug() {
+    if (rendered) return;
+    var app = document.getElementById("app");
+    var items = recentMethods.length
+      ? recentMethods.map(function (m) { return "<li>" + escapeHtml(m) + "</li>"; }).join("")
+      : "<li>(no messages received)</li>";
+    app.innerHTML =
+      '<div class="empty">No image received yet.<br>Last messages from host:</div>' +
+      '<ul class="debug">' + items + "</ul>";
+  }
+
   function render(urls) {
     var app = document.getElementById("app");
-    if (!urls.length) {
-      app.innerHTML = '<div class="empty">No image URL in result.</div>';
-      return;
-    }
     app.innerHTML = "";
     urls.forEach(function (url) {
       var img = document.createElement("img");
@@ -88,11 +138,36 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
       app.appendChild(img);
       app.appendChild(a);
     });
+    rendered = true;
+  }
+
+  function renderImages(imgs) {
+    var app = document.getElementById("app");
+    app.innerHTML = "";
+    imgs.forEach(function (im) {
+      var img = document.createElement("img");
+      img.src = "data:" + im.mimeType + ";base64," + im.data;
+      img.alt = "Generated image";
+      app.appendChild(img);
+    });
+    rendered = true;
+  }
+
+  function handleContent(content) {
+    var urls = extractUrls(content);
+    if (urls.length) {
+      render(urls);
+      return;
+    }
+    var imgs = extractImages(content);
+    if (imgs.length) renderImages(imgs);
   }
 
   window.addEventListener("message", function (event) {
     var data = event.data;
     if (!data || data.jsonrpc !== "2.0") return;
+
+    logMessage(data);
 
     if (data.id !== undefined && (data.result !== undefined || data.error !== undefined)) {
       var p = pending[data.id];
@@ -101,14 +176,23 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
         if (data.error) p.reject(new Error(data.error.message || "error"));
         else p.resolve(data.result);
       }
+      // Some hosts embed the tool result directly on the ui/initialize response
+      // instead of (or in addition to) sending a separate tool-result notification.
+      var resultContent = findContent(data.result);
+      if (resultContent) handleContent(resultContent);
       return;
     }
 
-    if (data.method === "ui/notifications/tool-result") {
-      render(extractUrls(data.params && data.params.content));
-    } else if (data.method === "ui/resource-teardown" && data.id !== undefined) {
+    if (data.method === "ui/resource-teardown" && data.id !== undefined) {
       window.parent.postMessage({ jsonrpc: "2.0", id: data.id, result: {} }, "*");
+      return;
     }
+
+    // Accept the tool result regardless of the exact method name (e.g.
+    // "ui/notifications/tool-result", "notifications/tool-result", "tools/result", ...) -
+    // what matters is that params carry a content array.
+    var paramsContent = findContent(data.params);
+    if (paramsContent) handleContent(paramsContent);
   });
 
   send("ui/initialize", {
@@ -116,9 +200,16 @@ const UI_RESOURCE_HTML = `<!DOCTYPE html>
     clientInfo: { name: "nano-banana-mcp-view", version: "1.0.0" },
     protocolVersion: "2026-01-26",
     appCapabilities: { availableDisplayModes: ["inline"] }
-  }).then(function () {
-    notify("ui/notifications/initialized", {});
-  });
+  }).then(
+    function () {
+      notify("ui/notifications/initialized", {});
+    },
+    function () {
+      showDebug();
+    }
+  );
+
+  setTimeout(showDebug, 3000);
 })();
 </script>
 </body>
