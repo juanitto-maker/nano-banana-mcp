@@ -85,401 +85,6 @@ function decodeImageSize(base64: string): { width: number; height: number } | nu
   return null;
 }
 
-// MCP Apps (SEP-1865, extension id "io.modelcontextprotocol/ui"): predeclared ui:// resource,
-// linked from the tool via _meta.ui.resourceUri, rendered in a sandboxed iframe by the host.
-const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
-const UI_MIME_TYPE = "text/html;profile=mcp-app";
-
-// Claude.ai caches view HTML by URI — bump VIEW_VERSION whenever UI_RESOURCE_HTML changes, so
-// the resource URI changes too and clients fetch the new HTML instead of a cached stale view.
-const VIEW_VERSION = "v5";
-const UI_RESOURCE_URI = `ui://nano-banana-mcp/image-view/${VIEW_VERSION}/app.html`;
-// Compat alias: the URI this server used before it was versioned. Some clients may have cached
-// a tool definition or resource reference pointing at this URI - resources/read still answers
-// it (with the current HTML) so those clients don't break. Not advertised in resources/list.
-const UI_RESOURCE_URI_LEGACY = "ui://nano-banana-mcp/generate-image-view";
-
-// Static view template: performs the ui/initialize handshake, then renders whatever image
-// URL(s) or image content arrive from the host, tolerating several message shapes since hosts
-// vary in how they deliver the tool result. No SDK dependency.
-//
-// Falls back to a small debug readout (last message methods received) if nothing rendered
-// within 3s or the handshake itself is rejected, so delivery mismatches are diagnosable.
-//
-// DIAGNOSTIC BUILD: the Claude Android client clamps the inline iframe to a fixed height and
-// ignores ui/notifications/size-changed, so this view measures the box it is actually given
-// instead of trying to resize it. Overlaid on the image are: a viewport/document/DPR readout,
-// a 50px grid (count the cells if the text is clipped), a magenta frame border (visible only
-// if our top and bottom edges survive), and four bottom-pinned swatches (a missing swatch
-// tells us how much of the bottom edge the host cut off).
-const UI_RESOURCE_HTML = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #111; color: #e6e6e6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-
-  /* Outermost element: the magenta frame. If a magenta edge is missing, that edge is clipped. */
-  #root { position: fixed; inset: 0; box-sizing: border-box; border: 6px solid magenta; background: #111; overflow: hidden; }
-
-  /* Image, full-bleed behind every diagnostic layer. */
-  .wrap { position: absolute; inset: 0; display: flex; flex-direction: row; align-items: center; justify-content: center; z-index: 1; }
-  img { flex: 1 1 0; min-width: 0; min-height: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
-  img.expandable { cursor: pointer; }
-  .empty { color: #9aa0a6; font-size: 13px; padding: 20px; text-align: center; }
-  .debug { list-style: none; margin: 8px 12px 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7a8085; }
-  .debug li { padding: 2px 0; border-bottom: 1px solid #1c1c1f; }
-
-  /* 50px reference grid - a countable ruler for when the numeric readout is cut off. */
-  #grid {
-    position: absolute; inset: 0; z-index: 2; pointer-events: none;
-    background-image:
-      repeating-linear-gradient(to right, rgba(255,255,255,0.25) 0 1px, transparent 1px 50px),
-      repeating-linear-gradient(to bottom, rgba(255,255,255,0.25) 0 1px, transparent 1px 50px);
-  }
-
-  /* Measurement readout, pinned top-left, outlined so it reads over any image. */
-  #diag {
-    position: absolute; top: 0; left: 0; z-index: 4; pointer-events: none;
-    margin: 0; padding: 6px 10px;
-    white-space: pre;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: clamp(14px, 5vw, 28px);
-    font-weight: 800;
-    line-height: 1.15;
-    color: #fff;
-    text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 0 6px #000;
-  }
-
-  /* Bottom-edge probe: whichever swatch is missing tells us where the bottom got cut. */
-  #swatches { position: absolute; left: 0; right: 0; bottom: 0; height: 40px; z-index: 3; display: flex; pointer-events: none; }
-  #swatches div { flex: 1 1 0; height: 40px; }
-  #swatches .s1 { background: #ff0000; }
-  #swatches .s2 { background: #00c000; }
-  #swatches .s3 { background: #0066ff; }
-  #swatches .s4 { background: #ffee00; }
-
-  #closeBtn {
-    display: none;
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    width: 44px;
-    height: 44px;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: rgba(0, 0, 0, 0.6);
-    color: #fff;
-    font-size: 20px;
-    line-height: 1;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    z-index: 5;
-  }
-
-  /* Lightbox: host granted the fullscreen display mode we requested on tap. */
-  html.fullscreen-mode, html.fullscreen-mode body, html.fullscreen-mode #root { background: #000; }
-  html.fullscreen-mode #closeBtn { display: flex; }
-</style>
-</head>
-<body>
-<div id="root">
-  <div class="wrap" id="app"><div class="empty">Waiting for image...</div></div>
-  <div id="grid"></div>
-  <div id="swatches"><div class="s1"></div><div class="s2"></div><div class="s3"></div><div class="s4"></div></div>
-  <pre id="diag">VP  ? x ?
-DOC ? x ?
-DPR ?</pre>
-  <button type="button" id="closeBtn" aria-label="Close fullscreen">&#10005;</button>
-</div>
-<script>
-(function () {
-  var nextId = 1;
-  var pending = {};
-  var recentMethods = [];
-  var rendered = false;
-
-  function send(method, params) {
-    var id = nextId++;
-    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params || {} }, "*");
-    var promise = new Promise(function (resolve, reject) {
-      pending[id] = { resolve: resolve, reject: reject };
-    });
-    promise.requestId = id;
-    return promise;
-  }
-
-  function notify(method, params) {
-    window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
-  }
-
-  // hostContext/hostCapabilities (SEP-1865) are captured from the ui/initialize result;
-  // hostContext is kept in sync afterwards via ui/notifications/host-context-changed. The
-  // lightbox has no state of its own - it's driven entirely by hostContext.displayMode, so a
-  // host that force-returns to "inline" on its own is reflected automatically, no separate
-  // bookkeeping needed.
-  var hostContext = {};
-  var hostCapabilities = {};
-  var initializeRequestId = null;
-
-  function fullscreenAvailable() {
-    var modes = hostContext.availableDisplayModes || [];
-    return modes.indexOf("fullscreen") !== -1;
-  }
-
-  function applyLayout() {
-    document.documentElement.classList.toggle("fullscreen-mode", hostContext.displayMode === "fullscreen");
-  }
-
-  function applyHostContext(partial) {
-    if (!partial || typeof partial !== "object") return;
-    for (var key in partial) {
-      if (Object.prototype.hasOwnProperty.call(partial, key)) hostContext[key] = partial[key];
-    }
-    applyLayout();
-  }
-
-  function applyInitializeResult(result) {
-    if (!result) return;
-    hostCapabilities = result.hostCapabilities || {};
-    applyHostContext(result.hostContext);
-  }
-
-  function requestDisplayMode(mode) {
-    send("ui/request-display-mode", { mode: mode }).then(function (result) {
-      hostContext.displayMode = (result && result.mode) || hostContext.displayMode || "inline";
-      applyLayout();
-    });
-  }
-
-  document.getElementById("closeBtn").addEventListener("click", function () {
-    requestDisplayMode("inline");
-  });
-
-  // Views MUST report their rendered size so the host can grow the iframe to fit, since the
-  // host has no other way to know the content outgrew its initial (often short) default frame.
-  // Debounced because img.onload and window "resize" can both fire in quick bursts.
-  var sizeReportTimer = null;
-  function reportSize() {
-    if (sizeReportTimer) clearTimeout(sizeReportTimer);
-    sizeReportTimer = setTimeout(function () {
-      sizeReportTimer = null;
-      notify("ui/notifications/size-changed", {
-        width: document.documentElement.scrollWidth,
-        height: document.documentElement.scrollHeight
-      });
-    }, 100);
-  }
-
-  // Self-measurement. The host clamps the inline iframe and ignores the size-changed
-  // notification above, so we report back the box we were actually handed. Sampled on a timer
-  // as well as on load/resize because the host may resize the frame after first paint without
-  // always firing a "resize" event we can observe.
-  function updateDiag() {
-    var el = document.getElementById("diag");
-    if (!el) return;
-    el.textContent =
-      "VP  " + window.innerWidth + " x " + window.innerHeight + "\\n" +
-      "DOC " + document.documentElement.clientWidth + " x " + document.documentElement.clientHeight + "\\n" +
-      "DPR " + (window.devicePixelRatio || 1);
-  }
-
-  var diagTimer = setInterval(updateDiag, 500);
-  setTimeout(function () { clearInterval(diagTimer); }, 5000);
-  window.addEventListener("load", updateDiag);
-  updateDiag();
-
-  window.addEventListener("resize", function () {
-    updateDiag();
-    reportSize();
-  });
-
-  function extractUrls(content) {
-    var urls = [];
-    (content || []).forEach(function (block) {
-      if (block && block.type === "text" && typeof block.text === "string") {
-        block.text.split("\\n").forEach(function (line) {
-          line = line.trim();
-          if (/^https?:\\/\\//.test(line)) urls.push(line);
-        });
-      }
-    });
-    return urls;
-  }
-
-  function extractImages(content) {
-    var imgs = [];
-    (content || []).forEach(function (block) {
-      if (block && block.type === "image" && typeof block.data === "string") {
-        imgs.push({ data: block.data, mimeType: block.mimeType || "image/png" });
-      }
-    });
-    return imgs;
-  }
-
-  // Any object carrying a tool result may nest it directly as { content: [...] }, or
-  // wrapped as { toolResult: { content: [...] } } depending on the host.
-  function findContent(obj) {
-    if (!obj || typeof obj !== "object") return null;
-    if (Array.isArray(obj.content)) return obj.content;
-    if (obj.toolResult && Array.isArray(obj.toolResult.content)) return obj.toolResult.content;
-    return null;
-  }
-
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
-  }
-
-  function logMessage(data) {
-    var label = data.method
-      ? data.method
-      : data.id !== undefined
-      ? "response(id=" + data.id + ")"
-      : "unknown";
-    recentMethods.push(label);
-    if (recentMethods.length > 10) recentMethods.shift();
-  }
-
-  function showDebug() {
-    if (rendered) return;
-    var app = document.getElementById("app");
-    var items = recentMethods.length
-      ? recentMethods.map(function (m) { return "<li>" + escapeHtml(m) + "</li>"; }).join("")
-      : "<li>(no messages received)</li>";
-    var box = document.createElement("div");
-    box.innerHTML =
-      '<div class="empty">No image received yet.<br>Last messages from host:</div>' +
-      '<ul class="debug">' + items + "</ul>";
-    app.innerHTML = "";
-    app.appendChild(box);
-  }
-
-  // Tap behavior, in priority order: request fullscreen if the host offers it (shows the
-  // lightbox once granted); otherwise ask the host to open the image's public URL, if it has
-  // one and the host supports it; otherwise the image just isn't interactive.
-  function attachTap(img, url) {
-    if (fullscreenAvailable()) {
-      img.className = "expandable";
-      img.addEventListener("click", function () {
-        requestDisplayMode("fullscreen");
-      });
-    } else if (url && hostCapabilities.openLinks) {
-      img.className = "expandable";
-      img.addEventListener("click", function () {
-        send("ui/open-link", { url: url }).catch(function () {});
-      });
-    }
-  }
-
-  function render(urls) {
-    var app = document.getElementById("app");
-    app.innerHTML = "";
-    urls.forEach(function (url) {
-      var img = document.createElement("img");
-      img.onload = reportSize;
-      img.src = url;
-      img.alt = "Generated image";
-      attachTap(img, url);
-      app.appendChild(img);
-    });
-    rendered = true;
-    reportSize();
-  }
-
-  function renderImages(imgs) {
-    var app = document.getElementById("app");
-    app.innerHTML = "";
-    imgs.forEach(function (im) {
-      var img = document.createElement("img");
-      img.onload = reportSize;
-      img.src = "data:" + im.mimeType + ";base64," + im.data;
-      img.alt = "Generated image";
-      attachTap(img);
-      app.appendChild(img);
-    });
-    rendered = true;
-    reportSize();
-  }
-
-  function handleContent(content) {
-    var urls = extractUrls(content);
-    if (urls.length) {
-      render(urls);
-      return;
-    }
-    var imgs = extractImages(content);
-    if (imgs.length) renderImages(imgs);
-  }
-
-  window.addEventListener("message", function (event) {
-    var data = event.data;
-    if (!data || data.jsonrpc !== "2.0") return;
-
-    logMessage(data);
-
-    if (data.id !== undefined && (data.result !== undefined || data.error !== undefined)) {
-      // Applied synchronously here (not in the send().then() below) so layout/capability state
-      // is in place before any tool-result content on this same response gets rendered.
-      if (data.id === initializeRequestId && data.result) {
-        applyInitializeResult(data.result);
-      }
-      var p = pending[data.id];
-      if (p) {
-        delete pending[data.id];
-        if (data.error) p.reject(new Error(data.error.message || "error"));
-        else p.resolve(data.result);
-      }
-      // Some hosts embed the tool result directly on the ui/initialize response
-      // instead of (or in addition to) sending a separate tool-result notification.
-      var resultContent = findContent(data.result);
-      if (resultContent) handleContent(resultContent);
-      return;
-    }
-
-    if (data.method === "ui/resource-teardown" && data.id !== undefined) {
-      window.parent.postMessage({ jsonrpc: "2.0", id: data.id, result: {} }, "*");
-      return;
-    }
-
-    if (data.method === "ui/notifications/host-context-changed") {
-      applyHostContext(data.params);
-      return;
-    }
-
-    // Accept the tool result regardless of the exact method name (e.g.
-    // "ui/notifications/tool-result", "notifications/tool-result", "tools/result", ...) -
-    // what matters is that params carry a content array.
-    var paramsContent = findContent(data.params);
-    if (paramsContent) handleContent(paramsContent);
-  });
-
-  var initPromise = send("ui/initialize", {
-    capabilities: {},
-    clientInfo: { name: "nano-banana-mcp-view", version: "1.0.0" },
-    protocolVersion: "2026-01-26",
-    appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] }
-  });
-  initializeRequestId = initPromise.requestId;
-  initPromise.then(
-    function () {
-      notify("ui/notifications/initialized", {});
-    },
-    function () {
-      showDebug();
-    }
-  );
-
-  setTimeout(showDebug, 3000);
-})();
-</script>
-</body>
-</html>
-`;
-
 const GEMINI_MODEL = "gemini-2.5-flash-image";
 const GEMINI_URL = (key: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
@@ -592,6 +197,16 @@ function seedForVariant(seed: number, index: number): number {
   return SEED_MIN + (((seed - SEED_MIN + index) % span) + span) % span;
 }
 
+// Every result must report the seed it used, so a caller who didn't supply one gets a seed
+// picked here and sent to Gemini rather than letting the model choose one it never tells us -
+// otherwise the seed is unknowable and the image can never be reproduced or refined.
+// Non-negative half of the int32 range, which is friendlier to copy back into a follow-up call.
+function randomSeed(): number {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return buf[0] >>> 1;
+}
+
 // Gemini's output resolutions are not exactly the nominal ratio (16:9 comes back as 1376x768),
 // so the comparison needs slack; 5% is far tighter than any ratio-vs-ratio confusion.
 function matchesAspectRatio(ratio: string, size: { width: number; height: number }): boolean {
@@ -601,25 +216,49 @@ function matchesAspectRatio(ratio: string, size: { width: number; height: number
   return Math.abs(want - size.width / size.height) / want <= 0.05;
 }
 
-// The settings line echoed back with every image, e.g. "1024x576 (16:9) - seed 4821 - temp 0.9",
-// so the chat side can report what was used and reuse it on a follow-up request.
+// edit_image can be called without an aspect ratio, but the settings line should still name the
+// framing that came back; the nearest supported ratio to the actual pixels is that answer.
+function inferAspectRatio(size: { width: number; height: number }): string | null {
+  if (!size.width || !size.height) return null;
+  const actual = size.width / size.height;
+  let best: string | null = null;
+  let bestError = Infinity;
+  for (const ratio of ASPECT_RATIOS) {
+    const [w, h] = ratio.split(":").map(Number);
+    const error = Math.abs(w / h - actual) / (w / h);
+    if (error < bestError) {
+      bestError = error;
+      best = ratio;
+    }
+  }
+  return bestError <= 0.05 ? best : null;
+}
+
+// The settings line echoed back with every image, e.g. "1024×576 (16:9) · seed 4821 · temp 0.9",
+// so the chat side can report what was used and reuse it on a follow-up request. The seed is
+// always known and always reported; the temperature reads "default" when the caller left the
+// model's own choice in place, since there is no single number to name.
 function formatSettings(opts: {
   size: { width: number; height: number } | null;
-  aspectRatio?: string;
-  seed?: number;
+  requestedAspectRatio?: string;
+  seed: number;
   temperature?: number;
 }): string {
+  const ratio =
+    opts.requestedAspectRatio ?? (opts.size ? inferAspectRatio(opts.size) : null);
   const dims = opts.size ? `${opts.size.width}×${opts.size.height}` : null;
+
   const parts: string[] = [];
-  if (dims && opts.aspectRatio) parts.push(`${dims} (${opts.aspectRatio})`);
+  if (dims && ratio) parts.push(`${dims} (${ratio})`);
   else if (dims) parts.push(dims);
-  else if (opts.aspectRatio) parts.push(opts.aspectRatio);
-  if (opts.seed !== undefined) parts.push(`seed ${opts.seed}`);
-  if (opts.temperature !== undefined) parts.push(`temp ${opts.temperature}`);
+  else if (ratio) parts.push(ratio);
+  parts.push(`seed ${opts.seed}`);
+  parts.push(opts.temperature !== undefined ? `temp ${opts.temperature}` : "temp default");
 
   let line = parts.join(" · ");
-  if (opts.aspectRatio && opts.size && !matchesAspectRatio(opts.aspectRatio, opts.size)) {
-    line += ` ⚠ model returned a different aspect ratio than the requested ${opts.aspectRatio}`;
+  const requested = opts.requestedAspectRatio;
+  if (requested && opts.size && !matchesAspectRatio(requested, opts.size)) {
+    line += ` ⚠ model returned a different aspect ratio than the requested ${requested}`;
   }
   return line;
 }
@@ -631,8 +270,7 @@ const TOOL_DEFINITION = {
     "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content. " +
     "Each image is returned with the settings it was produced under — resolution, aspect ratio, seed and " +
     "temperature — so those can be reported back to the user and reused in a follow-up request. " +
-    "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image. " +
-    "On hosts that support MCP Apps, the image also renders inline as an embedded HTML view.",
+    "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image.",
   inputSchema: {
     type: "object",
     properties: {
@@ -663,9 +301,11 @@ const TOOL_DEFINITION = {
         type: "integer",
         description:
           "Seed for reproducible output. The same prompt, aspect ratio, temperature and seed give " +
-          "back the same image, so pass a previous result's seed to reproduce or nudge that image, " +
-          "and omit it for a fresh random result. With count > 1 the seed is incremented per " +
-          "variation (seed, seed+1, ...), which is why the variations differ but stay reproducible.",
+          "back the same image, so pass a previous result's seed to reproduce or nudge that image. " +
+          "Omit it for a fresh random result: a seed is then chosen server-side and reported back " +
+          "with the image, so every result can be reproduced. With count > 1 the seed is " +
+          "incremented per variation (seed, seed+1, ...), which is why the variations differ but " +
+          "stay reproducible.",
       },
       temperature: {
         type: "number",
@@ -679,12 +319,6 @@ const TOOL_DEFINITION = {
     },
     required: ["prompt"],
   },
-  _meta: {
-    ui: {
-      resourceUri: UI_RESOURCE_URI,
-      visibility: ["model", "app"],
-    },
-  },
 };
 
 const EDIT_TOOL_DEFINITION = {
@@ -693,8 +327,7 @@ const EDIT_TOOL_DEFINITION = {
     "Edit an existing image with a natural-language instruction, using Google's Gemini 2.5 Flash Image model (nano banana). " +
     "The source image can be a public HTTPS URL or the 8-character id from a previous generate_image/edit_image result " +
     "(the trailing segment of its returned URL). The result includes a publicly reachable URL for each output image " +
-    "(valid for 24 hours) alongside the raw image content. On hosts that support MCP Apps, the image also renders inline " +
-    "as an embedded HTML view.",
+    "(valid for 24 hours) alongside the raw image content, plus the settings it was produced under.",
   inputSchema: {
     type: "object",
     properties: {
@@ -720,7 +353,8 @@ const EDIT_TOOL_DEFINITION = {
         type: "integer",
         description:
           "Seed for reproducible output. The same source, instruction, temperature and seed give " +
-          "back the same edit. Omit for a fresh random result.",
+          "back the same edit. Omit for a fresh random result: a seed is then chosen server-side " +
+          "and reported back with the image, so every edit can be reproduced.",
       },
       temperature: {
         type: "number",
@@ -733,12 +367,6 @@ const EDIT_TOOL_DEFINITION = {
       },
     },
     required: ["image", "instruction"],
-  },
-  _meta: {
-    ui: {
-      resourceUri: UI_RESOURCE_URI,
-      visibility: ["model", "app"],
-    },
   },
 };
 
@@ -872,11 +500,10 @@ async function storeImage(
   return `${ctx.origin}/${ctx.token}/img/${id}`;
 }
 
-// One text block per image, URL on its own first line (the MCP App view scans text blocks for
-// http lines) followed by the settings actually used, then the raw image blocks for hosts that
-// render base64 directly.
+// One text block per image: URL on its own first line, then the settings actually used. The raw
+// image blocks follow, for hosts that render base64 directly.
 function buildImageBlock(url: string, settings: string) {
-  return { type: "text", text: settings ? `${url}\n${settings}` : url };
+  return { type: "text", text: `${url}\n${settings}` };
 }
 
 async function handleRpc(
@@ -890,50 +517,12 @@ async function handleRpc(
         protocolVersion: "2024-11-05",
         capabilities: {
           tools: {},
-          resources: {},
-          extensions: {
-            [UI_EXTENSION_ID]: { mimeTypes: [UI_MIME_TYPE] },
-          },
         },
         serverInfo: { name: "nano-banana-mcp", version: "1.0.0" },
       });
 
     case "tools/list":
       return jsonRpcResult(req.id, { tools: [TOOL_DEFINITION, EDIT_TOOL_DEFINITION] });
-
-    case "resources/list":
-      return jsonRpcResult(req.id, {
-        resources: [
-          {
-            uri: UI_RESOURCE_URI,
-            name: "Generated Image Viewer",
-            description:
-              "Inline MCP App view that renders the image(s) produced by generate_image or edit_image.",
-            mimeType: UI_MIME_TYPE,
-          },
-        ],
-      });
-
-    case "resources/read": {
-      const uri = req.params?.uri;
-      if (uri !== UI_RESOURCE_URI && uri !== UI_RESOURCE_URI_LEGACY) {
-        return jsonRpcError(req.id, -32602, `Unknown resource: ${uri}`);
-      }
-      return jsonRpcResult(req.id, {
-        contents: [
-          {
-            uri,
-            mimeType: UI_MIME_TYPE,
-            text: UI_RESOURCE_HTML,
-            _meta: {
-              ui: {
-                csp: { resourceDomains: [ctx.origin] },
-              },
-            },
-          },
-        ],
-      });
-    }
 
     case "tools/call": {
       const { name, arguments: args } = req.params ?? {};
@@ -955,13 +544,15 @@ async function handleRpc(
         const temperature = parseTemperature(args?.temperature);
         if ("error" in temperature) return toolError(req.id, temperature.error);
 
+        // A caller who didn't pick a seed still gets one, so the result stays reproducible.
+        const baseSeed = seed.value ?? randomSeed();
+
         const textBlocks: any[] = [];
         const imageBlocks: any[] = [];
         let failure: { variant: number; message: string } | null = null;
 
         for (let i = 0; i < count.value; i++) {
-          const variantSeed =
-            seed.value === undefined ? undefined : seedForVariant(seed.value, i);
+          const variantSeed = seedForVariant(baseSeed, i);
           const params: GenerationParams = {
             aspectRatio: aspectRatio.value,
             seed: variantSeed,
@@ -980,7 +571,7 @@ async function handleRpc(
             const url = await storeImage(env, img, ctx);
             const settings = formatSettings({
               size: decodeImageSize(img.data),
-              aspectRatio: aspectRatio.value,
+              requestedAspectRatio: aspectRatio.value,
               seed: variantSeed,
               temperature: temperature.value,
             });
@@ -1038,9 +629,11 @@ async function handleRpc(
             return toolError(req.id, source.error);
           }
 
+          // As in generate_image: always send a known seed, so the edit can be reproduced.
+          const effectiveSeed = seed.value ?? randomSeed();
           const params: GenerationParams = {
             aspectRatio: aspectRatio.value,
-            seed: seed.value,
+            seed: effectiveSeed,
             temperature: temperature.value,
           };
           const images = await callGeminiEdit(env, source, instruction, params);
@@ -1053,8 +646,8 @@ async function handleRpc(
                 url,
                 formatSettings({
                   size: decodeImageSize(img.data),
-                  aspectRatio: aspectRatio.value,
-                  seed: seed.value,
+                  requestedAspectRatio: aspectRatio.value,
+                  seed: effectiveSeed,
                   temperature: temperature.value,
                 })
               )
