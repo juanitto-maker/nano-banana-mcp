@@ -2,7 +2,7 @@
 
 A Cloudflare Worker exposing Google's Gemini 2.5 Flash Image model ("nano banana") as an MCP tool, for use as a custom connector in Claude.ai.
 
-Exposes two tools: `generate_image(prompt, aspect_ratio?, num_images?)` and `edit_image(image, instruction, aspect_ratio?)`.
+Exposes two tools: `generate_image(prompt, aspect_ratio?, count?, seed?, temperature?)` and `edit_image(image, instruction, aspect_ratio?, seed?, temperature?)`.
 
 Connector URL format (once deployed):
 ```
@@ -10,6 +10,67 @@ https://nano-banana-mcp.<subdomain>.workers.dev/<MCP_AUTH_TOKEN>/mcp
 ```
 
 See DEPLOY.md for first-time setup.
+
+## Parameters
+
+### `generate_image`
+
+| Param | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `prompt` | string | yes | — | Description of the image. Style direction belongs here. |
+| `aspect_ratio` | enum | no | `1:1` | One of `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. |
+| `count` | integer | no | `1` | 1–4. Each variation is a separate billed generation with its own URL. |
+| `seed` | integer | no | random | int32. Same prompt + ratio + temperature + seed reproduces the same image. With `count > 1` the seed is incremented per variation (`seed`, `seed+1`, …). |
+| `temperature` | number | no | model default | 0–2. Lower is more literal, higher more inventive. |
+
+`num_images` is still accepted as a deprecated alias for `count`, so clients holding a cached copy of the old tool definition keep working.
+
+### `edit_image`
+
+| Param | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `image` | string | yes | — | Public HTTPS URL, or the 8-character id from a previous result. |
+| `instruction` | string | yes | — | The edit to perform, e.g. "make it dusk". |
+| `aspect_ratio` | enum | no | source framing | Same values as above. Omit to leave the framing alone. |
+| `seed` | integer | no | random | int32, as above. |
+| `temperature` | number | no | model default | 0–2, as above. |
+
+An invalid enum value or an out-of-range number comes back as an `isError` result naming the valid values, without spending a Gemini call.
+
+### How the parameters reach Gemini
+
+All of them go into `generationConfig` on the `generateContent` body — the aspect ratio specifically into `generationConfig.imageConfig.aspectRatio`:
+
+```json
+{
+  "contents": [...],
+  "generationConfig": {
+    "temperature": 0.9,
+    "seed": 4821,
+    "responseModalities": ["TEXT", "IMAGE"],
+    "imageConfig": { "aspectRatio": "16:9" }
+  }
+}
+```
+
+`temperature` and `seed` are omitted from the body entirely when not supplied, so the model's own defaults apply. Earlier versions of this server instead appended `(aspect ratio 16:9)` to the prompt text, which left the ratio a suggestion the model was free to ignore — that is why 16:9 requests kept coming back square. `count` is handled as sequential `generateContent` calls rather than one call asking for N images, which the model answers inconsistently.
+
+### Settings echo
+
+Every image comes back as its own text content block: the URL on the first line, then the settings it was actually produced under, so the chat side can report them and reuse them in a follow-up request.
+
+```
+https://nano-banana-mcp.<subdomain>.workers.dev/<token>/img/8be62d09
+variant 2/3 · 1376×768 (16:9) · seed 101 · temp 0.9
+```
+
+The resolution is read from the returned image's own header rather than assumed from the requested ratio, so if the model ignores the aspect ratio the line says so:
+
+```
+1024×1024 (16:9) ⚠ model returned a different aspect ratio than the requested 16:9
+```
+
+If a variation fails partway through a `count > 1` batch, the images already generated are still returned, with a trailing note naming the variation that failed and why.
 
 ## Image URLs
 
@@ -29,7 +90,7 @@ https://nano-banana-mcp.<subdomain>.workers.dev/<MCP_AUTH_TOKEN>/img/<id>
 - a public HTTPS URL to an image, or
 - the 8-character id from a previous `generate_image`/`edit_image` result (the trailing segment of its returned `/img/<id>` URL).
 
-If `aspect_ratio` is omitted, the source image's framing is preserved. Source images are capped at ~6 MB. Like `generate_image`, results are stored in KV and returned as URL(s) + raw image content, so edited images can themselves be passed back into `edit_image` by id for further edits.
+If `aspect_ratio` is omitted, no `imageConfig` is sent at all and the source image's framing is preserved. Source images are capped at ~6 MB. Like `generate_image`, results are stored in KV and returned as URL(s) + raw image content, so edited images can themselves be passed back into `edit_image` by id for further edits.
 
 ## MCP Apps (inline rendering)
 

@@ -29,6 +29,62 @@ function base64ByteLength(base64: string): number {
   return (base64.length * 3) / 4 - padding;
 }
 
+// Reads pixel dimensions out of an encoded image's header so results can report the resolution
+// the model actually produced, rather than the one that was asked for - the two diverge whenever
+// Gemini ignores the requested aspect ratio. Returns null for formats it can't read, which only
+// costs the dimensions in the echoed settings line.
+function decodeImageSize(base64: string): { width: number; height: number } | null {
+  // Only the leading header is needed; decoding whole multi-MB payloads here would be wasteful.
+  // Sliced on a 4-character boundary so the remainder still decodes as valid base64.
+  const prefix = base64.slice(0, 8192);
+  let bytes: Uint8Array;
+  try {
+    bytes = base64ToBytes(prefix.slice(0, prefix.length - (prefix.length % 4)));
+  } catch {
+    return null;
+  }
+
+  // PNG: 8-byte signature, then the IHDR chunk carrying width/height as big-endian uint32s.
+  if (
+    bytes.length >= 24 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+
+  // JPEG: walk the segment chain to the start-of-frame marker, which holds height then width.
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < bytes.length) {
+      if (bytes[i] !== 0xff) {
+        i++;
+        continue;
+      }
+      const marker = bytes[i + 1];
+      // Standalone markers (padding, RSTn, SOI, EOI) carry no length field.
+      if (marker === 0xff || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
+        i += 2;
+        continue;
+      }
+      const isStartOfFrame =
+        marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isStartOfFrame) {
+        return {
+          width: (bytes[i + 7] << 8) | bytes[i + 8],
+          height: (bytes[i + 5] << 8) | bytes[i + 6],
+        };
+      }
+      i += 2 + ((bytes[i + 2] << 8) | bytes[i + 3]);
+    }
+  }
+
+  return null;
+}
+
 // MCP Apps (SEP-1865, extension id "io.modelcontextprotocol/ui"): predeclared ui:// resource,
 // linked from the tool via _meta.ui.resourceUri, rendered in a sandboxed iframe by the host.
 const UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
@@ -443,11 +499,138 @@ function jsonRpcError(id: string | number | null, code: number, message: string)
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
+// A tool-level failure: a normal JSON-RPC result carrying isError, per the MCP spec, so the
+// client model sees the message and can correct itself rather than getting a protocol error.
+function toolError(id: string | number | null, message: string) {
+  return jsonRpcResult(id, { isError: true, content: [{ type: "text", text: message }] });
+}
+
+// The ten aspect ratios gemini-2.5-flash-image supports.
+const ASPECT_RATIOS = [
+  "1:1",
+  "2:3",
+  "3:2",
+  "3:4",
+  "4:3",
+  "4:5",
+  "5:4",
+  "9:16",
+  "16:9",
+  "21:9",
+];
+const DEFAULT_ASPECT_RATIO = "1:1";
+const MAX_COUNT = 4;
+// Gemini's seed is an int32.
+const SEED_MIN = -2147483648;
+const SEED_MAX = 2147483647;
+
+type Parsed<T> = { value: T } | { error: string };
+
+function parseAspectRatio(raw: unknown): Parsed<string> {
+  if (raw === undefined || raw === null) return { value: DEFAULT_ASPECT_RATIO };
+  if (typeof raw !== "string" || !ASPECT_RATIOS.includes(raw)) {
+    return {
+      error: `Invalid 'aspect_ratio': ${JSON.stringify(raw)}. Valid values are ${ASPECT_RATIOS.join(
+        ", "
+      )}.`,
+    };
+  }
+  return { value: raw };
+}
+
+// Optional aspect ratio: omitted means "leave the framing alone", which is what edit_image wants.
+function parseOptionalAspectRatio(raw: unknown): Parsed<string | undefined> {
+  if (raw === undefined || raw === null) return { value: undefined };
+  return parseAspectRatio(raw);
+}
+
+// Numeric arguments arrive as JSON numbers from well-behaved clients, but some send strings;
+// both are accepted, anything else is rejected with the valid range spelled out.
+function toNumber(raw: unknown): number {
+  if (typeof raw === "number") return raw;
+  if (typeof raw === "string" && raw.trim() !== "") return Number(raw);
+  return NaN;
+}
+
+function parseCount(raw: unknown): Parsed<number> {
+  if (raw === undefined || raw === null) return { value: 1 };
+  const n = toNumber(raw);
+  if (!Number.isInteger(n) || n < 1 || n > MAX_COUNT) {
+    return {
+      error: `Invalid 'count': ${JSON.stringify(raw)}. Must be an integer between 1 and ${MAX_COUNT}.`,
+    };
+  }
+  return { value: n };
+}
+
+function parseSeed(raw: unknown): Parsed<number | undefined> {
+  if (raw === undefined || raw === null) return { value: undefined };
+  const n = toNumber(raw);
+  if (!Number.isInteger(n) || n < SEED_MIN || n > SEED_MAX) {
+    return {
+      error: `Invalid 'seed': ${JSON.stringify(raw)}. Must be an integer between ${SEED_MIN} and ${SEED_MAX}.`,
+    };
+  }
+  return { value: n };
+}
+
+function parseTemperature(raw: unknown): Parsed<number | undefined> {
+  if (raw === undefined || raw === null) return { value: undefined };
+  const n = toNumber(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 2) {
+    return {
+      error: `Invalid 'temperature': ${JSON.stringify(raw)}. Must be a number between 0 and 2.`,
+    };
+  }
+  return { value: n };
+}
+
+// Variants must differ from each other but stay reproducible, so each one bumps the base seed.
+// Wraps at the int32 boundary instead of running off the end of the range Gemini accepts.
+function seedForVariant(seed: number, index: number): number {
+  const span = SEED_MAX - SEED_MIN + 1;
+  return SEED_MIN + (((seed - SEED_MIN + index) % span) + span) % span;
+}
+
+// Gemini's output resolutions are not exactly the nominal ratio (16:9 comes back as 1376x768),
+// so the comparison needs slack; 5% is far tighter than any ratio-vs-ratio confusion.
+function matchesAspectRatio(ratio: string, size: { width: number; height: number }): boolean {
+  const [w, h] = ratio.split(":").map(Number);
+  if (!w || !h || !size.width || !size.height) return true;
+  const want = w / h;
+  return Math.abs(want - size.width / size.height) / want <= 0.05;
+}
+
+// The settings line echoed back with every image, e.g. "1024x576 (16:9) - seed 4821 - temp 0.9",
+// so the chat side can report what was used and reuse it on a follow-up request.
+function formatSettings(opts: {
+  size: { width: number; height: number } | null;
+  aspectRatio?: string;
+  seed?: number;
+  temperature?: number;
+}): string {
+  const dims = opts.size ? `${opts.size.width}×${opts.size.height}` : null;
+  const parts: string[] = [];
+  if (dims && opts.aspectRatio) parts.push(`${dims} (${opts.aspectRatio})`);
+  else if (dims) parts.push(dims);
+  else if (opts.aspectRatio) parts.push(opts.aspectRatio);
+  if (opts.seed !== undefined) parts.push(`seed ${opts.seed}`);
+  if (opts.temperature !== undefined) parts.push(`temp ${opts.temperature}`);
+
+  let line = parts.join(" · ");
+  if (opts.aspectRatio && opts.size && !matchesAspectRatio(opts.aspectRatio, opts.size)) {
+    line += ` ⚠ model returned a different aspect ratio than the requested ${opts.aspectRatio}`;
+  }
+  return line;
+}
+
 const TOOL_DEFINITION = {
   name: "generate_image",
   description:
     "Generate one or more images from a text prompt using Google's Gemini 2.5 Flash Image model (nano banana). " +
     "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content. " +
+    "Each image is returned with the settings it was produced under — resolution, aspect ratio, seed and " +
+    "temperature — so those can be reported back to the user and reused in a follow-up request. " +
     "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image. " +
     "On hosts that support MCP Apps, the image also renders inline as an embedded HTML view.",
   inputSchema: {
@@ -455,18 +638,43 @@ const TOOL_DEFINITION = {
     properties: {
       prompt: {
         type: "string",
-        description: "Text description of the image to generate.",
+        description:
+          "Text description of the image to generate. Detail helps: subject, setting, lighting, " +
+          "camera or art style, mood. Style direction belongs here rather than in any other parameter.",
       },
       aspect_ratio: {
         type: "string",
-        enum: ["1:1", "16:9", "9:16", "4:3", "3:4"],
-        description: "Desired aspect ratio. Defaults to 1:1.",
+        enum: ASPECT_RATIOS,
+        description:
+          "Framing of the output image. Landscape: 3:2, 4:3, 5:4, 16:9, 21:9 (21:9 is cinematic/ultrawide). " +
+          "Portrait: 2:3, 3:4, 4:5, 9:16 (9:16 suits phone wallpapers and social stories). Square: 1:1. " +
+          "Defaults to 1:1, so pass this explicitly whenever the image is not meant to be square.",
       },
-      num_images: {
+      count: {
         type: "integer",
         minimum: 1,
-        maximum: 4,
-        description: "Number of images to generate (1-4). Defaults to 1.",
+        maximum: MAX_COUNT,
+        description:
+          "How many separate variations to generate, 1-4. Defaults to 1. Each variation is a full " +
+          "billed generation from the same prompt and comes back with its own URL, so ask for more " +
+          "than one only when the user wants options to choose between.",
+      },
+      seed: {
+        type: "integer",
+        description:
+          "Seed for reproducible output. The same prompt, aspect ratio, temperature and seed give " +
+          "back the same image, so pass a previous result's seed to reproduce or nudge that image, " +
+          "and omit it for a fresh random result. With count > 1 the seed is incremented per " +
+          "variation (seed, seed+1, ...), which is why the variations differ but stay reproducible.",
+      },
+      temperature: {
+        type: "number",
+        minimum: 0,
+        maximum: 2,
+        description:
+          "Sampling randomness, 0-2. Lower values (around 0.2-0.5) stay literal and close to the " +
+          "prompt; higher values (around 1.0-1.5) are more inventive and varied. Omit to use the " +
+          "model's own default.",
       },
     },
     required: ["prompt"],
@@ -502,8 +710,26 @@ const EDIT_TOOL_DEFINITION = {
       },
       aspect_ratio: {
         type: "string",
-        enum: ["1:1", "16:9", "9:16", "4:3", "3:4"],
-        description: "Desired output aspect ratio. If omitted, the source image's framing is preserved.",
+        enum: ASPECT_RATIOS,
+        description:
+          "Reframe the output to this aspect ratio. Landscape: 3:2, 4:3, 5:4, 16:9, 21:9. " +
+          "Portrait: 2:3, 3:4, 4:5, 9:16. Square: 1:1. Omit to preserve the source image's framing, " +
+          "which is usually what an edit wants.",
+      },
+      seed: {
+        type: "integer",
+        description:
+          "Seed for reproducible output. The same source, instruction, temperature and seed give " +
+          "back the same edit. Omit for a fresh random result.",
+      },
+      temperature: {
+        type: "number",
+        minimum: 0,
+        maximum: 2,
+        description:
+          "Sampling randomness, 0-2. Lower values (around 0.2-0.5) apply the instruction " +
+          "conservatively and stay closer to the source; higher values take more liberties. " +
+          "Omit to use the model's own default.",
       },
     },
     required: ["image", "instruction"],
@@ -518,14 +744,28 @@ const EDIT_TOOL_DEFINITION = {
 
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 
-async function callGeminiApi(env: Env, contents: any[]) {
+interface GenerationParams {
+  aspectRatio?: string;
+  seed?: number;
+  temperature?: number;
+}
+
+// Generation parameters belong in generationConfig, and the aspect ratio specifically in
+// generationConfig.imageConfig.aspectRatio. Appending "(aspect ratio 16:9)" to the prompt text
+// instead - as this server used to - makes the ratio a suggestion the model is free to ignore,
+// which is why 16:9 requests kept coming back square.
+async function callGeminiApi(env: Env, contents: any[], params: GenerationParams) {
+  const generationConfig: Record<string, unknown> = {
+    responseModalities: ["TEXT", "IMAGE"],
+  };
+  if (params.temperature !== undefined) generationConfig.temperature = params.temperature;
+  if (params.seed !== undefined) generationConfig.seed = params.seed;
+  if (params.aspectRatio) generationConfig.imageConfig = { aspectRatio: params.aspectRatio };
+
   const resp = await fetch(GEMINI_URL(env.GEMINI_API_KEY), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents,
-      generationConfig: { responseModalities: ["IMAGE"] },
-    }),
+    body: JSON.stringify({ contents, generationConfig }),
   });
 
   if (!resp.ok) {
@@ -550,32 +790,32 @@ async function callGeminiApi(env: Env, contents: any[]) {
   return images;
 }
 
-async function callGemini(env: Env, prompt: string, aspectRatio: string, numImages: number) {
-  const fullPrompt =
-    numImages > 1
-      ? `Generate ${numImages} distinct variations. ${prompt} (aspect ratio ${aspectRatio})`
-      : `${prompt} (aspect ratio ${aspectRatio})`;
-
-  return callGeminiApi(env, [{ role: "user", parts: [{ text: fullPrompt }] }]);
+// One call produces one variation. Multiple variations are separate sequential calls (see the
+// generate_image handler) rather than one call asking the model for N images, which it answers
+// inconsistently.
+async function callGemini(env: Env, prompt: string, params: GenerationParams) {
+  return callGeminiApi(env, [{ role: "user", parts: [{ text: prompt }] }], params);
 }
 
 async function callGeminiEdit(
   env: Env,
   source: { data: string; mimeType: string },
   instruction: string,
-  aspectRatio?: string
+  params: GenerationParams
 ) {
-  const text = aspectRatio ? `${instruction} (aspect ratio ${aspectRatio})` : instruction;
-
-  return callGeminiApi(env, [
-    {
-      role: "user",
-      parts: [
-        { inline_data: { mime_type: source.mimeType, data: source.data } },
-        { text },
-      ],
-    },
-  ]);
+  return callGeminiApi(
+    env,
+    [
+      {
+        role: "user",
+        parts: [
+          { inline_data: { mime_type: source.mimeType, data: source.data } },
+          { text: instruction },
+        ],
+      },
+    ],
+    params
+  );
 }
 
 async function resolveSourceImage(
@@ -619,22 +859,24 @@ async function resolveSourceImage(
   };
 }
 
-async function storeImagesAndBuildContent(
+async function storeImage(
   env: Env,
-  images: Array<{ type: string; data: string; mimeType: string }>,
+  img: { data: string; mimeType: string },
   ctx: { origin: string; token: string }
-) {
-  const urls: string[] = [];
-  for (const img of images) {
-    const id = crypto.randomUUID().slice(0, 8);
-    await env.IMAGES.put(`img:${id}`, img.data, {
-      expirationTtl: IMAGE_TTL_SECONDS,
-      metadata: { mimeType: img.mimeType },
-    });
-    urls.push(`${ctx.origin}/${ctx.token}/img/${id}`);
-  }
+): Promise<string> {
+  const id = crypto.randomUUID().slice(0, 8);
+  await env.IMAGES.put(`img:${id}`, img.data, {
+    expirationTtl: IMAGE_TTL_SECONDS,
+    metadata: { mimeType: img.mimeType },
+  });
+  return `${ctx.origin}/${ctx.token}/img/${id}`;
+}
 
-  return [{ type: "text", text: urls.join("\n") }, ...images];
+// One text block per image, URL on its own first line (the MCP App view scans text blocks for
+// http lines) followed by the settings actually used, then the raw image blocks for hosts that
+// render base64 directly.
+function buildImageBlock(url: string, settings: string) {
+  return { type: "text", text: settings ? `${url}\n${settings}` : url };
 }
 
 async function handleRpc(
@@ -699,60 +941,128 @@ async function handleRpc(
       if (name === "generate_image") {
         const prompt = args?.prompt;
         if (!prompt || typeof prompt !== "string") {
-          return jsonRpcResult(req.id, {
-            isError: true,
-            content: [{ type: "text", text: "Missing required 'prompt' argument." }],
-          });
+          return toolError(req.id, "Missing required 'prompt' argument.");
         }
-        const aspectRatio = args?.aspect_ratio || "1:1";
-        const numImages = Math.min(Math.max(parseInt(args?.num_images ?? "1", 10) || 1, 1), 4);
 
-        try {
-          const images = await callGemini(env, prompt, aspectRatio, numImages);
-          const content = await storeImagesAndBuildContent(env, images, ctx);
-          return jsonRpcResult(req.id, { content, isError: false });
-        } catch (err: any) {
-          return jsonRpcResult(req.id, {
-            isError: true,
-            content: [{ type: "text", text: `generate_image failed: ${err.message || String(err)}` }],
+        const aspectRatio = parseAspectRatio(args?.aspect_ratio);
+        if ("error" in aspectRatio) return toolError(req.id, aspectRatio.error);
+        // `num_images` is the pre-rename name for `count`, still accepted so clients holding a
+        // cached copy of the old tool definition keep getting the number of images they asked for.
+        const count = parseCount(args?.count ?? args?.num_images);
+        if ("error" in count) return toolError(req.id, count.error);
+        const seed = parseSeed(args?.seed);
+        if ("error" in seed) return toolError(req.id, seed.error);
+        const temperature = parseTemperature(args?.temperature);
+        if ("error" in temperature) return toolError(req.id, temperature.error);
+
+        const textBlocks: any[] = [];
+        const imageBlocks: any[] = [];
+        let failure: { variant: number; message: string } | null = null;
+
+        for (let i = 0; i < count.value; i++) {
+          const variantSeed =
+            seed.value === undefined ? undefined : seedForVariant(seed.value, i);
+          const params: GenerationParams = {
+            aspectRatio: aspectRatio.value,
+            seed: variantSeed,
+            temperature: temperature.value,
+          };
+
+          let images: Array<{ type: string; data: string; mimeType: string }>;
+          try {
+            images = await callGemini(env, prompt, params);
+          } catch (err: any) {
+            failure = { variant: i + 1, message: err.message || String(err) };
+            break;
+          }
+
+          for (const img of images) {
+            const url = await storeImage(env, img, ctx);
+            const settings = formatSettings({
+              size: decodeImageSize(img.data),
+              aspectRatio: aspectRatio.value,
+              seed: variantSeed,
+              temperature: temperature.value,
+            });
+            textBlocks.push(
+              buildImageBlock(
+                url,
+                count.value > 1 ? `variant ${i + 1}/${count.value} · ${settings}` : settings
+              )
+            );
+            imageBlocks.push(img);
+          }
+        }
+
+        if (imageBlocks.length === 0) {
+          const detail = failure
+            ? count.value > 1
+              ? `variant ${failure.variant}/${count.value}: ${failure.message}`
+              : failure.message
+            : "Gemini returned no image data.";
+          return toolError(req.id, `generate_image failed: ${detail}`);
+        }
+
+        const content = [...textBlocks, ...imageBlocks];
+        // Every variant is a separate billed call, so a mid-run failure still returns whatever
+        // was already generated instead of discarding it.
+        if (failure) {
+          content.push({
+            type: "text",
+            text: `Stopped after ${imageBlocks.length} of ${count.value} variants — variant ${failure.variant} failed: ${failure.message}`,
           });
         }
+        return jsonRpcResult(req.id, { content, isError: false });
       }
 
       if (name === "edit_image") {
         const image = args?.image;
         if (!image || typeof image !== "string") {
-          return jsonRpcResult(req.id, {
-            isError: true,
-            content: [{ type: "text", text: "Missing required 'image' argument." }],
-          });
+          return toolError(req.id, "Missing required 'image' argument.");
         }
         const instruction = args?.instruction;
         if (!instruction || typeof instruction !== "string") {
-          return jsonRpcResult(req.id, {
-            isError: true,
-            content: [{ type: "text", text: "Missing required 'instruction' argument." }],
-          });
+          return toolError(req.id, "Missing required 'instruction' argument.");
         }
-        const aspectRatio = typeof args?.aspect_ratio === "string" ? args.aspect_ratio : undefined;
+
+        const aspectRatio = parseOptionalAspectRatio(args?.aspect_ratio);
+        if ("error" in aspectRatio) return toolError(req.id, aspectRatio.error);
+        const seed = parseSeed(args?.seed);
+        if ("error" in seed) return toolError(req.id, seed.error);
+        const temperature = parseTemperature(args?.temperature);
+        if ("error" in temperature) return toolError(req.id, temperature.error);
 
         try {
           const source = await resolveSourceImage(env, image);
           if ("error" in source) {
-            return jsonRpcResult(req.id, {
-              isError: true,
-              content: [{ type: "text", text: source.error }],
-            });
+            return toolError(req.id, source.error);
           }
 
-          const images = await callGeminiEdit(env, source, instruction, aspectRatio);
-          const content = await storeImagesAndBuildContent(env, images, ctx);
-          return jsonRpcResult(req.id, { content, isError: false });
+          const params: GenerationParams = {
+            aspectRatio: aspectRatio.value,
+            seed: seed.value,
+            temperature: temperature.value,
+          };
+          const images = await callGeminiEdit(env, source, instruction, params);
+
+          const textBlocks: any[] = [];
+          for (const img of images) {
+            const url = await storeImage(env, img, ctx);
+            textBlocks.push(
+              buildImageBlock(
+                url,
+                formatSettings({
+                  size: decodeImageSize(img.data),
+                  aspectRatio: aspectRatio.value,
+                  seed: seed.value,
+                  temperature: temperature.value,
+                })
+              )
+            );
+          }
+          return jsonRpcResult(req.id, { content: [...textBlocks, ...images], isError: false });
         } catch (err: any) {
-          return jsonRpcResult(req.id, {
-            isError: true,
-            content: [{ type: "text", text: `edit_image failed: ${err.message || String(err)}` }],
-          });
+          return toolError(req.id, `edit_image failed: ${err.message || String(err)}`);
         }
       }
 
