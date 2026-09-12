@@ -85,9 +85,15 @@ function decodeImageSize(base64: string): { width: number; height: number } | nu
   return null;
 }
 
-const GEMINI_MODEL = "gemini-2.5-flash-image";
-const GEMINI_URL = (key: string) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+// "normal" stays the default in every code path below - callers that never mention `model` must
+// keep hitting gemini-2.5-flash-image at the same cost as before this map existed.
+const GEMINI_MODELS: Record<string, string> = {
+  normal: "gemini-2.5-flash-image",
+  pro: "gemini-3-pro-image-preview",
+};
+const DEFAULT_MODEL = "normal";
+const GEMINI_URL = (key: string, modelId: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${key}`;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -190,6 +196,35 @@ function parseTemperature(raw: unknown): Parsed<number | undefined> {
   return { value: n };
 }
 
+const MODEL_KEYS = Object.keys(GEMINI_MODELS);
+
+function parseModel(raw: unknown): Parsed<string> {
+  if (raw === undefined || raw === null) return { value: DEFAULT_MODEL };
+  if (typeof raw !== "string" || !MODEL_KEYS.includes(raw)) {
+    return {
+      error: `Invalid 'model': ${JSON.stringify(raw)}. Valid values are ${MODEL_KEYS.join(", ")}.`,
+    };
+  }
+  return { value: raw };
+}
+
+// Resolution only means anything to the pro model; parsing it here regardless of the chosen
+// model keeps the "never silently ignore a parameter" behaviour possible for the normal model.
+const RESOLUTIONS = ["1k", "2k", "4k"];
+const DEFAULT_RESOLUTION = "1k";
+
+function parseResolution(raw: unknown): Parsed<string> {
+  if (raw === undefined || raw === null) return { value: DEFAULT_RESOLUTION };
+  if (typeof raw !== "string" || !RESOLUTIONS.includes(raw)) {
+    return {
+      error: `Invalid 'resolution': ${JSON.stringify(raw)}. Valid values are ${RESOLUTIONS.join(
+        ", "
+      )}.`,
+    };
+  }
+  return { value: raw };
+}
+
 // Variants must differ from each other but stay reproducible, so each one bumps the base seed.
 // Wraps at the int32 boundary instead of running off the end of the range Gemini accepts.
 function seedForVariant(seed: number, index: number): number {
@@ -243,6 +278,9 @@ function formatSettings(opts: {
   requestedAspectRatio?: string;
   seed: number;
   temperature?: number;
+  model: string;
+  resolution: string;
+  resolutionDropped: boolean;
 }): string {
   const ratio =
     opts.requestedAspectRatio ?? (opts.size ? inferAspectRatio(opts.size) : null);
@@ -254,6 +292,13 @@ function formatSettings(opts: {
   else if (ratio) parts.push(ratio);
   parts.push(`seed ${opts.seed}`);
   parts.push(opts.temperature !== undefined ? `temp ${opts.temperature}` : "temp default");
+  parts.push(`model ${opts.model}`);
+  if (opts.model === "pro") {
+    parts.push(opts.resolution);
+    parts.push(`~$${opts.resolution === "4k" ? "0.24" : "0.134"}`);
+  } else if (opts.resolutionDropped) {
+    parts.push("resolution dropped (normal model)");
+  }
 
   let line = parts.join(" · ");
   const requested = opts.requestedAspectRatio;
@@ -270,7 +315,8 @@ const TOOL_DEFINITION = {
     "The result includes a publicly reachable URL for each image (valid for 24 hours) alongside the raw image content. " +
     "Each image is returned with the settings it was produced under — resolution, aspect ratio, seed and " +
     "temperature — so those can be reported back to the user and reused in a follow-up request. " +
-    "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image.",
+    "Each URL's trailing 8-character id can be passed to edit_image to make further edits to that image. " +
+    "The model is selectable via the optional 'model' parameter and defaults to the normal Gemini 2.5 Flash Image model.",
   inputSchema: {
     type: "object",
     properties: {
@@ -316,6 +362,26 @@ const TOOL_DEFINITION = {
           "prompt; higher values (around 1.0-1.5) are more inventive and varied. Omit to use the " +
           "model's own default.",
       },
+      model: {
+        type: "string",
+        enum: MODEL_KEYS,
+        default: "normal",
+        description:
+          "Which Gemini image model to use. 'normal' (default) is Gemini 2.5 Flash Image (nano " +
+          "banana), ~$0.039/image. 'pro' is Nano Banana Pro (Gemini 3 Pro Image), ~$0.134/image at " +
+          "1K/2K resolution and ~$0.24/image at 4K — roughly 3.4x the cost of normal — with better " +
+          "prompt adherence, text rendering, and multi-image consistency. Only pass 'pro' when the " +
+          "user has explicitly asked for it; otherwise leave this unset.",
+      },
+      resolution: {
+        type: "string",
+        enum: RESOLUTIONS,
+        default: "1k",
+        description:
+          "Output resolution. Only affects the 'pro' model — the 'normal' model ignores this and " +
+          "the response will note that the resolution was dropped. Defaults to '1k'. '4k' costs " +
+          "more than '1k'/'2k' (~$0.24 vs ~$0.134 per image).",
+      },
     },
     required: ["prompt"],
   },
@@ -327,7 +393,8 @@ const EDIT_TOOL_DEFINITION = {
     "Edit an existing image with a natural-language instruction, using Google's Gemini 2.5 Flash Image model (nano banana). " +
     "The source image can be a public HTTPS URL or the 8-character id from a previous generate_image/edit_image result " +
     "(the trailing segment of its returned URL). The result includes a publicly reachable URL for each output image " +
-    "(valid for 24 hours) alongside the raw image content, plus the settings it was produced under.",
+    "(valid for 24 hours) alongside the raw image content, plus the settings it was produced under. " +
+    "The model is selectable via the optional 'model' parameter and defaults to the normal Gemini 2.5 Flash Image model.",
   inputSchema: {
     type: "object",
     properties: {
@@ -365,6 +432,26 @@ const EDIT_TOOL_DEFINITION = {
           "conservatively and stay closer to the source; higher values take more liberties. " +
           "Omit to use the model's own default.",
       },
+      model: {
+        type: "string",
+        enum: MODEL_KEYS,
+        default: "normal",
+        description:
+          "Which Gemini image model to use. 'normal' (default) is Gemini 2.5 Flash Image (nano " +
+          "banana), ~$0.039/image. 'pro' is Nano Banana Pro (Gemini 3 Pro Image), ~$0.134/image at " +
+          "1K/2K resolution and ~$0.24/image at 4K — roughly 3.4x the cost of normal — with better " +
+          "prompt adherence, text rendering, and multi-image consistency. Only pass 'pro' when the " +
+          "user has explicitly asked for it; otherwise leave this unset.",
+      },
+      resolution: {
+        type: "string",
+        enum: RESOLUTIONS,
+        default: "1k",
+        description:
+          "Output resolution. Only affects the 'pro' model — the 'normal' model ignores this and " +
+          "the response will note that the resolution was dropped. Defaults to '1k'. '4k' costs " +
+          "more than '1k'/'2k' (~$0.24 vs ~$0.134 per image).",
+      },
     },
     required: ["image", "instruction"],
   },
@@ -376,6 +463,8 @@ interface GenerationParams {
   aspectRatio?: string;
   seed?: number;
   temperature?: number;
+  model?: string;
+  resolution?: string;
 }
 
 // Generation parameters belong in generationConfig, and the aspect ratio specifically in
@@ -383,14 +472,27 @@ interface GenerationParams {
 // instead - as this server used to - makes the ratio a suggestion the model is free to ignore,
 // which is why 16:9 requests kept coming back square.
 async function callGeminiApi(env: Env, contents: any[], params: GenerationParams) {
+  // No `model` in params must resolve to the same normal model this server always used, so a
+  // caller unaware of the pro option sees no change in behaviour or cost.
+  const modelKey = params.model ?? DEFAULT_MODEL;
+  const modelId = GEMINI_MODELS[modelKey];
+
   const generationConfig: Record<string, unknown> = {
     responseModalities: ["TEXT", "IMAGE"],
   };
   if (params.temperature !== undefined) generationConfig.temperature = params.temperature;
   if (params.seed !== undefined) generationConfig.seed = params.seed;
   if (params.aspectRatio) generationConfig.imageConfig = { aspectRatio: params.aspectRatio };
+  // imageSize is a pro-only knob; sending it to the normal model would be silently ignored by
+  // Gemini anyway, but keeping it out entirely matches "no behaviour change without `model`".
+  if (modelKey === "pro" && params.resolution) {
+    generationConfig.imageConfig = {
+      ...(generationConfig.imageConfig as Record<string, unknown> | undefined),
+      imageSize: params.resolution.toUpperCase(),
+    };
+  }
 
-  const resp = await fetch(GEMINI_URL(env.GEMINI_API_KEY), {
+  const resp = await fetch(GEMINI_URL(env.GEMINI_API_KEY, modelId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ contents, generationConfig }),
@@ -518,7 +620,7 @@ async function handleRpc(
         capabilities: {
           tools: {},
         },
-        serverInfo: { name: "nano-banana-mcp", version: "1.0.0" },
+        serverInfo: { name: "nano-banana-mcp", version: "1.1.0" },
       });
 
     case "tools/list":
@@ -543,6 +645,14 @@ async function handleRpc(
         if ("error" in seed) return toolError(req.id, seed.error);
         const temperature = parseTemperature(args?.temperature);
         if ("error" in temperature) return toolError(req.id, temperature.error);
+        const model = parseModel(args?.model);
+        if ("error" in model) return toolError(req.id, model.error);
+        const resolution = parseResolution(args?.resolution);
+        if ("error" in resolution) return toolError(req.id, resolution.error);
+        // Only note a drop when the caller actually passed a resolution - the default value
+        // itself is not something to warn about on the normal model.
+        const resolutionDropped =
+          args?.resolution !== undefined && args?.resolution !== null && model.value !== "pro";
 
         // A caller who didn't pick a seed still gets one, so the result stays reproducible.
         const baseSeed = seed.value ?? randomSeed();
@@ -557,6 +667,8 @@ async function handleRpc(
             aspectRatio: aspectRatio.value,
             seed: variantSeed,
             temperature: temperature.value,
+            model: model.value,
+            resolution: resolution.value,
           };
 
           let images: Array<{ type: string; data: string; mimeType: string }>;
@@ -574,6 +686,9 @@ async function handleRpc(
               requestedAspectRatio: aspectRatio.value,
               seed: variantSeed,
               temperature: temperature.value,
+              model: model.value,
+              resolution: resolution.value,
+              resolutionDropped,
             });
             textBlocks.push(
               buildImageBlock(
@@ -622,6 +737,12 @@ async function handleRpc(
         if ("error" in seed) return toolError(req.id, seed.error);
         const temperature = parseTemperature(args?.temperature);
         if ("error" in temperature) return toolError(req.id, temperature.error);
+        const model = parseModel(args?.model);
+        if ("error" in model) return toolError(req.id, model.error);
+        const resolution = parseResolution(args?.resolution);
+        if ("error" in resolution) return toolError(req.id, resolution.error);
+        const resolutionDropped =
+          args?.resolution !== undefined && args?.resolution !== null && model.value !== "pro";
 
         try {
           const source = await resolveSourceImage(env, image);
@@ -635,6 +756,8 @@ async function handleRpc(
             aspectRatio: aspectRatio.value,
             seed: effectiveSeed,
             temperature: temperature.value,
+            model: model.value,
+            resolution: resolution.value,
           };
           const images = await callGeminiEdit(env, source, instruction, params);
 
@@ -649,6 +772,9 @@ async function handleRpc(
                   requestedAspectRatio: aspectRatio.value,
                   seed: effectiveSeed,
                   temperature: temperature.value,
+                  model: model.value,
+                  resolution: resolution.value,
+                  resolutionDropped,
                 })
               )
             );
